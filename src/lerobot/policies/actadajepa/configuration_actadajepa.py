@@ -71,6 +71,22 @@ class ACTAdaJEPAConfig(ACTConfig):
     mpc_goal_batch_key: str = "jepa_goal_latent"
     mpc_goal_latent: list[float] | None = None
 
+    # Adaptive execution horizon. Disabled by default. When enabled,
+    # ACTAdaJEPA still predicts a full action chunk, but only enqueues the
+    # prefix considered reliable by AdaJEPA rollout signals and optional
+    # contact/force observations.
+    use_adaptive_horizon: bool = False
+    min_execution_horizon: int = 1
+    max_execution_horizon: int | None = None
+    uncertainty_threshold: float | None = 0.2
+    prediction_error_threshold: float | None = 0.2
+
+    contact_replan: bool = True
+    contact_replan_horizon: int = 1
+    contact_batch_key: str = "contact"
+    force_batch_key: str = "observation.force"
+    force_threshold: float | None = None
+
     def __post_init__(self):
         super().__post_init__()
         if self.jepa_loss_weight < 0:
@@ -98,6 +114,22 @@ class ACTAdaJEPAConfig(ACTConfig):
             value = getattr(self, name)
             if value < 0:
                 raise ValueError(f"`{name}` must be non-negative. Got {value}.")
+        if self.min_execution_horizon <= 0:
+            raise ValueError(
+                f"`min_execution_horizon` must be positive. Got {self.min_execution_horizon}."
+            )
+        if self.max_execution_horizon is not None and self.max_execution_horizon <= 0:
+            raise ValueError(
+                f"`max_execution_horizon` must be positive when set. Got {self.max_execution_horizon}."
+            )
+        if self.contact_replan_horizon <= 0:
+            raise ValueError(
+                f"`contact_replan_horizon` must be positive. Got {self.contact_replan_horizon}."
+            )
+        for name in ["uncertainty_threshold", "prediction_error_threshold", "force_threshold"]:
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"`{name}` must be non-negative when set. Got {value}.")
 
     @property
     def observation_delta_indices(self) -> list[int] | None:
