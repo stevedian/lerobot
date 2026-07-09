@@ -25,6 +25,8 @@ from lerobot.policies.actadajepa.configuration_actadajepa import ACTAdaJEPAConfi
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
+PlanInfo = dict[str, float | int | str | Tensor]
+
 
 class ACTAdaJEPAPolicy(ACTPolicy):
     """ACT behavior cloning with an AdaJEPA-style latent dynamics auxiliary loss."""
@@ -56,15 +58,21 @@ class ACTAdaJEPAPolicy(ACTPolicy):
 
         if self.config.temporal_ensemble_coeff is not None:
             actions, plan_info = self.plan_action_chunk(batch)
-            self._last_plan_info = plan_info
+            self._last_plan_info = self._public_plan_info(plan_info)
             action = self.temporal_ensembler.update(actions)
             self._last_action = action.detach()
             return action
 
         if len(self._action_queue) == 0:
             actions, plan_info = self.plan_action_chunk(batch)
-            self._last_plan_info = plan_info
-            actions = actions[:, : self.config.n_action_steps]
+            execution_horizon, horizon_info = self.choose_execution_horizon(
+                batch=batch,
+                plan_info=plan_info,
+                action_chunk_size=actions.shape[1],
+            )
+            plan_info.update(horizon_info)
+            self._last_plan_info = self._public_plan_info(plan_info)
+            actions = actions[:, :execution_horizon]
             self._action_queue.extend(actions.transpose(0, 1))
 
         action = self._action_queue.popleft()
@@ -90,19 +98,23 @@ class ACTAdaJEPAPolicy(ACTPolicy):
         return actions
 
     @torch.no_grad()
-    def plan_action_chunk(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float | int | str]]:
+    def plan_action_chunk(self, batch: dict[str, Tensor]) -> tuple[Tensor, PlanInfo]:
         """Predict an ACT chunk and optionally apply AdaJEPA residual correction."""
         act_actions = self.predict_action_chunk(batch)
         if not self.config.use_residual_mpc or self.config.mpc_num_iters == 0:
-            return act_actions, {"mpc_enabled": 0, "mpc_horizon": 0}
+            plan_info: PlanInfo = {"mpc_enabled": 0, "mpc_horizon": 0}
+            self._add_adaptive_horizon_signals(batch, act_actions, plan_info)
+            return act_actions, plan_info
 
-        return self.optimize_residual_actions(batch, act_actions)
+        corrected_actions, plan_info = self.optimize_residual_actions(batch, act_actions)
+        self._add_adaptive_horizon_signals(batch, corrected_actions, plan_info)
+        return corrected_actions, plan_info
 
     def optimize_residual_actions(
         self,
         batch: dict[str, Tensor],
         act_actions: Tensor,
-    ) -> tuple[Tensor, dict[str, float | int | str]]:
+    ) -> tuple[Tensor, PlanInfo]:
         """Optimize a small action residual through the AdaJEPA latent dynamics model.
 
         The policy weights are kept fixed. Only a temporary `delta_action`
@@ -156,6 +168,148 @@ class ACTAdaJEPAPolicy(ACTPolicy):
         for name, value in last_costs.items():
             info[f"mpc_{name}"] = float(value.detach().item())
         return corrected_actions, info
+
+    def choose_execution_horizon(
+        self,
+        batch: dict[str, Tensor],
+        plan_info: PlanInfo,
+        action_chunk_size: int,
+    ) -> tuple[int, dict[str, float | int | str]]:
+        """Choose how many actions from the current chunk should be executed before replanning."""
+        max_horizon = min(self.config.n_action_steps, action_chunk_size)
+        if self.config.max_execution_horizon is not None:
+            max_horizon = min(max_horizon, self.config.max_execution_horizon)
+        min_horizon = min(self.config.min_execution_horizon, max_horizon)
+
+        if not self.config.use_adaptive_horizon:
+            return max_horizon, {
+                "adaptive_horizon_enabled": 0,
+                "adaptive_execution_horizon": max_horizon,
+                "adaptive_replan_reason": "fixed_n_action_steps",
+            }
+
+        execution_horizon = max_horizon
+        reason = "max_horizon"
+
+        uncertainty = plan_info.get("_adaptive_uncertainty")
+        if (
+            isinstance(uncertainty, Tensor)
+            and self.config.uncertainty_threshold is not None
+            and uncertainty.numel() > 0
+        ):
+            threshold_index = self._first_threshold_index(uncertainty, self.config.uncertainty_threshold)
+            if threshold_index is not None:
+                execution_horizon = min(execution_horizon, threshold_index + 1)
+                reason = "uncertainty_threshold"
+
+        prediction_error = plan_info.get("_adaptive_prediction_error")
+        if (
+            isinstance(prediction_error, Tensor)
+            and self.config.prediction_error_threshold is not None
+            and prediction_error.numel() > 0
+        ):
+            threshold_index = self._first_threshold_index(
+                prediction_error, self.config.prediction_error_threshold
+            )
+            if threshold_index is not None:
+                execution_horizon = min(execution_horizon, threshold_index + 1)
+                reason = "prediction_error_threshold"
+
+        if self.config.contact_replan and self._detect_contact_or_force(batch):
+            execution_horizon = min(execution_horizon, self.config.contact_replan_horizon)
+            reason = "contact_or_force"
+
+        execution_horizon = max(min_horizon, min(execution_horizon, max_horizon))
+        return execution_horizon, {
+            "adaptive_horizon_enabled": 1,
+            "adaptive_execution_horizon": execution_horizon,
+            "adaptive_min_execution_horizon": min_horizon,
+            "adaptive_max_execution_horizon": max_horizon,
+            "adaptive_replan_reason": reason,
+        }
+
+    def _add_adaptive_horizon_signals(
+        self,
+        batch: dict[str, Tensor],
+        actions: Tensor,
+        plan_info: PlanInfo,
+    ) -> None:
+        if not self.config.use_adaptive_horizon:
+            return
+
+        horizon = min(actions.shape[1], self.config.n_action_steps)
+        if self.config.max_execution_horizon is not None:
+            horizon = min(horizon, self.config.max_execution_horizon)
+        if horizon <= 0:
+            return
+
+        current_batch = self._prepare_current_jepa_batch(batch)
+        action_prefix = actions[:, :horizon].detach()
+        with torch.no_grad():
+            initial_latent = self.model.encode_jepa_observation(current_batch)
+            rollout = self.model.rollout_jepa_latents(initial_latent, action_prefix)
+
+        previous_latents = torch.cat([initial_latent[:, None], rollout[:, :-1]], dim=1)
+        uncertainty = (rollout - previous_latents).norm(dim=-1).mean(dim=0)
+        plan_info["_adaptive_uncertainty"] = uncertainty.detach()
+        plan_info["adaptive_uncertainty_mean"] = float(uncertainty.mean().item())
+        plan_info["adaptive_uncertainty_max"] = float(uncertainty.max().item())
+
+        target_latent, target_source = self._resolve_explicit_mpc_target_latent(batch, initial_latent)
+        if target_latent is None:
+            plan_info["adaptive_prediction_error_source"] = "none"
+            return
+
+        prediction_error = (rollout - target_latent[:, None]).pow(2).mean(dim=-1).mean(dim=0)
+        plan_info["_adaptive_prediction_error"] = prediction_error.detach()
+        plan_info["adaptive_prediction_error_source"] = target_source
+        plan_info["adaptive_prediction_error_mean"] = float(prediction_error.mean().item())
+        plan_info["adaptive_prediction_error_final"] = float(prediction_error[-1].item())
+
+    def _resolve_explicit_mpc_target_latent(
+        self,
+        batch: dict[str, Tensor],
+        initial_latent: Tensor,
+    ) -> tuple[Tensor | None, str]:
+        goal_key = self.config.mpc_goal_batch_key
+        if goal_key in batch and isinstance(batch[goal_key], Tensor):
+            goal_latent = batch[goal_key].to(device=initial_latent.device, dtype=initial_latent.dtype)
+            return self._expand_goal_latent(goal_latent, initial_latent).detach(), "batch_goal_latent"
+
+        if self.config.mpc_goal_latent is not None:
+            goal_latent = torch.tensor(
+                self.config.mpc_goal_latent,
+                device=initial_latent.device,
+                dtype=initial_latent.dtype,
+            )
+            return self._expand_goal_latent(goal_latent, initial_latent).detach(), "config_goal_latent"
+
+        return None, "none"
+
+    def _first_threshold_index(self, values: Tensor, threshold: float) -> int | None:
+        exceeded = torch.nonzero(values > threshold, as_tuple=False)
+        if exceeded.numel() == 0:
+            return None
+        return int(exceeded[0, 0].item())
+
+    def _detect_contact_or_force(self, batch: dict[str, Tensor]) -> bool:
+        contact = batch.get(self.config.contact_batch_key)
+        if isinstance(contact, Tensor) and bool(contact.detach().bool().any().item()):
+            return True
+
+        if self.config.force_threshold is None:
+            return False
+
+        force = batch.get(self.config.force_batch_key)
+        if not isinstance(force, Tensor):
+            return False
+
+        force = force.detach().to(dtype=torch.float32)
+        force_norm = force.norm().unsqueeze(0) if force.ndim == 1 else force.flatten(start_dim=1).norm(dim=-1)
+        return bool((force_norm > self.config.force_threshold).any().item())
+
+    def _public_plan_info(self, plan_info: PlanInfo) -> dict[str, float | int | str]:
+        return {key: value for key, value in plan_info.items() if not isinstance(value, Tensor)}
 
     def _prepare_current_jepa_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         current_batch, _, _ = self._split_current_next_observations(batch)
