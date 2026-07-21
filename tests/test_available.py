@@ -22,6 +22,7 @@ import lerobot
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.actadajepa.modeling_actadajepa import ACTAdaJEPAPolicy
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from lerobot.policies.diffusion_jepa.modeling_diffusion_jepa import DiffusionJEPAPolicy
 from lerobot.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
 from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 from tests.utils import require_env
@@ -46,7 +47,14 @@ def test_available_policies():
     This test verifies that the class attribute `name` for all policies is
     consistent with those listed in `lerobot/__init__.py`.
     """
-    policy_classes = [ACTPolicy, ACTAdaJEPAPolicy, DiffusionPolicy, TDMPCPolicy, VQBeTPolicy]
+    policy_classes = [
+        ACTPolicy,
+        ACTAdaJEPAPolicy,
+        DiffusionPolicy,
+        DiffusionJEPAPolicy,
+        TDMPCPolicy,
+        VQBeTPolicy,
+    ]
     policies = [pol_cls.name for pol_cls in policy_classes]
     assert set(policies) == set(lerobot.available_policies), policies
 
