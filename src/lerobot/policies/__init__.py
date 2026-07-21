@@ -15,6 +15,7 @@
 from .act.configuration_act import ACTConfig as ACTConfig
 from .actadajepa.configuration_actadajepa import ACTAdaJEPAConfig as ACTAdaJEPAConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .diffusion_jepa.configuration_diffusion_jepa import DiffusionJEPAConfig as DiffusionJEPAConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
@@ -30,6 +31,7 @@ __all__ = [
     "ACTConfig",
     "ACTAdaJEPAConfig",
     "DiffusionConfig",
+    "DiffusionJEPAConfig",
     "PI0Config",
     "PI05Config",
     "PI0FastConfig",

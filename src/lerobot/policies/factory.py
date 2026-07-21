@@ -32,6 +32,7 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.actadajepa.configuration_actadajepa import ACTAdaJEPAConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.diffusion_jepa.configuration_diffusion_jepa import DiffusionJEPAConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -84,6 +85,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 
         return DiffusionPolicy
+    elif name == "diffusion_jepa":
+        from lerobot.policies.diffusion_jepa.modeling_diffusion_jepa import DiffusionJEPAPolicy
+
+        return DiffusionJEPAPolicy
     elif name == "act":
         from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -166,6 +171,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
+    elif policy_type == "diffusion_jepa":
+        return DiffusionJEPAConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "actadajepa":
@@ -296,6 +303,16 @@ def make_pre_post_processors(
         from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, DiffusionJEPAConfig):
+        from lerobot.policies.diffusion_jepa.processor_diffusion_jepa import (
+            make_diffusion_jepa_pre_post_processors,
+        )
+
+        processors = make_diffusion_jepa_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
