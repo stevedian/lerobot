@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionModel
 from lerobot.policies.diffusion_jepa.configuration_diffusion_jepa import DiffusionJEPAConfig
 from lerobot.policies.diffusion_jepa.modeling_diffusion_jepa import DiffusionJEPAModel, DiffusionJEPAPolicy
 from lerobot.policies.diffusion_jepa.sigreg import SIGReg
@@ -83,6 +84,8 @@ def test_config_requests_history_and_future_observations() -> None:
         _make_config(jepa_latent_dim=10)
     with pytest.raises(ValueError, match="executed action chunk"):
         _make_config(jepa_candidate_horizon=3)
+    with pytest.raises(ValueError, match="residual_scale"):
+        _make_config(jepa_condition_residual_scale=-0.1)
 
 
 def test_joint_loss_backpropagates_through_one_shared_encoder() -> None:
@@ -92,11 +95,86 @@ def test_joint_loss_backpropagates_through_one_shared_encoder() -> None:
     loss.backward()
 
     assert set(metrics).issuperset(
-        {"diffusion_loss", "lewm_prediction_loss", "sigreg_loss", "latent_feature_std"}
+        {
+            "diffusion_loss",
+            "lewm_prediction_loss",
+            "sigreg_loss",
+            "latent_feature_std",
+            "jepa_condition_residual_norm",
+        }
     )
+    assert metrics["jepa_condition_residual_norm"] == 0
     assert any(parameter.grad is not None for parameter in model.observation_encoder.parameters())
     assert any(parameter.grad is not None for parameter in model.world_model_predictor.parameters())
+    assert model.jepa_condition_residual.weight.grad is not None
+    assert model.jepa_condition_residual.weight.grad.abs().sum() > 0
     assert not any("target_encoder" in name for name, _ in model.named_modules())
+
+
+def test_zero_initialized_jepa_residual_preserves_baseline_condition() -> None:
+    model = DiffusionJEPAModel(_make_config())
+    model.eval()
+    batch = _make_batch()
+    raw_features, latents = model.observation_encoder.forward_with_raw(batch)
+
+    global_condition = model._prepare_global_conditioning(raw_features, latents)
+    expected_baseline_condition = raw_features[:, : model.config.n_obs_steps].flatten(start_dim=1)
+
+    torch.testing.assert_close(global_condition, expected_baseline_condition)
+    assert torch.count_nonzero(model.jepa_condition_residual.weight) == 0
+    assert torch.count_nonzero(model.jepa_condition_residual.bias) == 0
+
+
+def test_jepa_residual_is_additive_after_adapter_update() -> None:
+    model = DiffusionJEPAModel(_make_config())
+    model.eval()
+    batch = _make_batch()
+    raw_features, latents = model.observation_encoder.forward_with_raw(batch)
+    with torch.no_grad():
+        model.jepa_condition_residual.weight.fill_(0.01)
+        model.jepa_condition_residual.bias.fill_(0.02)
+
+    global_condition = model._prepare_global_conditioning(raw_features, latents)
+    residual = model.jepa_condition_residual(latents[:, : model.config.n_obs_steps])
+    expected = (
+        raw_features[:, : model.config.n_obs_steps] + model.config.jepa_condition_residual_scale * residual
+    ).flatten(start_dim=1)
+    torch.testing.assert_close(global_condition, expected)
+
+
+def test_zero_residual_scale_keeps_exact_baseline_condition() -> None:
+    model = DiffusionJEPAModel(_make_config(jepa_condition_residual_scale=0.0))
+    model.eval()
+    batch = _make_batch()
+    raw_features, latents = model.observation_encoder.forward_with_raw(batch)
+    with torch.no_grad():
+        model.jepa_condition_residual.weight.normal_()
+        model.jepa_condition_residual.bias.normal_()
+
+    global_condition = model._prepare_global_conditioning(raw_features, latents)
+    expected = raw_features[:, : model.config.n_obs_steps].flatten(start_dim=1)
+    torch.testing.assert_close(global_condition, expected)
+
+
+def test_zero_initialized_residual_matches_diffusion_actions_with_shared_unet() -> None:
+    config = _make_config(num_inference_steps=2)
+    baseline = DiffusionModel(config)
+    model = DiffusionJEPAModel(config)
+    model.unet.load_state_dict(baseline.unet.state_dict())
+    baseline.eval()
+    model.eval()
+
+    batch = {
+        OBS_STATE: torch.randn(2, config.n_obs_steps, 3),
+        OBS_ENV_STATE: torch.randn(2, config.n_obs_steps, 6),
+    }
+    noise = torch.randn(2, config.horizon, 2)
+
+    torch.manual_seed(0)
+    baseline_actions = baseline.generate_actions(batch, noise=noise.clone())
+    torch.manual_seed(0)
+    jepa_actions = model.generate_actions(batch, noise=noise.clone())
+    torch.testing.assert_close(baseline_actions, jepa_actions, rtol=0, atol=0)
 
 
 def test_world_model_uses_actions_starting_at_current_timestep() -> None:

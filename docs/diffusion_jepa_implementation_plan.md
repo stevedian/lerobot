@@ -101,11 +101,13 @@ Phase 2 选出 action chunk 后，仍沿用原始 Diffusion Policy 的固定 act
     RGB camera(s) -> visual backbone -> visual features
     robot state   -> state projection
     env/task info -> optional projection
-    concat + fusion MLP -> z_i
+    concat -> 原始控制特征 r_i
+        ├── 保留为 Diffusion baseline condition
+        └── fusion MLP + projector -> JEPA latent z_i
 
                        ┌──────────────────────────────────────────┐
-z_{t-n+1:t} ---------->│ Diffusion condition projection           │
-                       │ -> conditional 1D U-Net                  │
+r_{t-n+1:t} ---------->│ condition = r + 0.1 * ZeroLinear(z)      │
+z_{t-n+1:t} ---------->│ -> conditional 1D U-Net                  │
 expert action chunk -->│ -> denoising loss L_diffusion            │
                        └──────────────────────────────────────────┘
 
@@ -122,10 +124,10 @@ all z_i
 
 ### 4.2 Shared observation encoder
 
-推荐把共享 encoder 定义为逐时间步编码器：
+推荐把共享 encoder 定义为逐时间步的双输出编码器：
 
 ```text
-z_i = SharedObservationEncoder(
+(r_i, z_i) = SharedObservationEncoder(
     images_i,
     robot_state_i,
     optional_environment_state_i,
@@ -145,10 +147,12 @@ z_i = SharedObservationEncoder(
 建议融合结构：
 
 ```text
-camera features -> concat
+camera features ─┐
 robot state -> Linear + SiLU
 env/task feature -> Linear + SiLU（如存在）
-all features -> Linear -> BatchNorm/LayerNorm -> z_i
+                 └→ concat -> r_i
+
+r_i -> Linear -> SiLU -> LayerNorm -> Linear -> step-wise BatchNorm -> z_i
 ```
 
 初始配置：
@@ -157,24 +161,35 @@ all features -> Linear -> BatchNorm/LayerNorm -> z_i
 jepa_latent_dim = 192
 ```
 
-LeWorldModel 在 ViT 的最终 LayerNorm 后增加 1 层 MLP + BatchNorm，使 SIGReg 能有效塑造输出分布。当前实现也应保留独立 projector，不能直接在已归一化的 backbone 输出上计算 SIGReg。
+LeWorldModel 在 ViT 的最终 LayerNorm 后增加 1 层 MLP + BatchNorm，使 SIGReg 能有效塑造输出分布。当前实现也保留独立 projector，并只对 `z_i` 计算 SIGReg。原始控制特征 `r_i` 不受 SIGReg 直接约束，避免丢失接近任务终点时所需的精细位置与小动作信息。
 
 ### 4.3 Diffusion 分支
 
-当前 Diffusion Policy 使用最近 `n_obs_steps` 帧作为 U-Net 的 global condition。新模型改成：
+当前 Diffusion Policy 使用最近 `n_obs_steps` 帧的原始特征作为 U-Net global condition。新模型在保留这条路径的基础上增加零初始化 JEPA residual：
 
 ```text
+r_history = [r_{t-n+1}, ..., r_t]
 z_history = [z_{t-n+1}, ..., z_t]
-condition = diffusion_condition_proj(z_history)
+
+jepa_residual = ZeroInitLinear(z_history)
+condition = r_history + residual_scale * jepa_residual
 global_cond = flatten(condition)
 ```
 
-`diffusion_condition_proj` 的输出宽度应与原始 per-frame condition 宽度一致，因此：
+`jepa_condition_residual` 的权重和偏置都初始化为零，默认 `residual_scale=0.1`。因此训练开始时：
+
+```text
+condition = r_history
+```
+
+即严格恢复原始 Diffusion condition。这样：
 
 - `DiffusionConditionalUnet1d.global_cond_dim` 不变；
-- U-Net 结构与纯 Diffusion baseline 一致；
+- U-Net 结构与输入语义在初始化时都与纯 Diffusion baseline 一致；
 - 可以单独加载已有 U-Net 权重；
-- Diffusion loss 的实现保持不变。
+- Diffusion loss 始终可以沿原始 `r_i` 路径训练视觉 backbone；
+- JEPA residual 只能逐渐增加信息，不能替代整个控制 condition；
+- 将 `jepa_condition_residual_scale=0` 可得到严格的原始 condition 消融。
 
 Diffusion 仍使用 clean action trajectory 加噪后进行 epsilon 或 sample prediction，不把 JEPA latent loss 混入噪声调度器。
 
@@ -245,8 +260,8 @@ L_total = L_diffusion + lambda_world_model * L_LeWM
 其中：
 
 ```text
-lambda_sigreg = 0.1       # LeWorldModel 论文默认值
-lambda_world_model = 0.1  # 本项目起始值，需要消融
+lambda_sigreg = 0.1        # LeWorldModel 论文默认值
+lambda_world_model = 0.02  # 保守起始值，降低精细控制梯度冲突
 sigreg_num_projections = 1024
 ```
 
@@ -297,10 +312,10 @@ L_SIGReg = mean_i(L_sigreg_i)
 ACT-JEPA 强调联合训练，因此不先单独预训练再冻结 encoder。为降低共享 encoder 初期的梯度冲突，可以只对权重做短 ramp：
 
 ```text
-0 ~ 5K steps:
-    lambda_world_model 从 0 线性增加到 0.1
+0 ~ 20K steps:
+    lambda_world_model 从 0 线性增加到 0.02
 
-5K+ steps:
+20K+ steps:
     完整联合训练，所有模块保持可学习
 ```
 
@@ -439,10 +454,11 @@ class DiffusionJEPAConfig(DiffusionConfig):
     jepa_predictor_dropout: float = 0.1
 
     jepa_prediction_horizon: int = 4
-    jepa_world_model_loss_weight: float = 0.1
+    jepa_world_model_loss_weight: float = 0.02
     jepa_sigreg_weight: float = 0.1
-    jepa_sigreg_num_projections: int = 1024
-    jepa_loss_ramp_steps: int = 5_000
+    jepa_sigreg_num_projections: int = 512
+    jepa_loss_ramp_steps: int = 20_000
+    jepa_condition_residual_scale: float = 0.1
 
     use_jepa_candidate_selection: bool = False
     jepa_num_action_candidates: int = 8
@@ -530,7 +546,8 @@ tests/policies/test_diffusion_jepa.py
 
 - 新建 `diffusion_jepa` 策略与配置；
 - 实现逐帧 shared observation encoder；
-- Diffusion 使用 shared latent history；
+- 同一次 backbone 前向同时生成原始控制特征与 JEPA latent；
+- Diffusion 使用原始 condition 加 zero-init JEPA residual；
 - 实现 causal Transformer predictor；
 - 在每个 predictor block 中实现 zero-init action AdaLN；
 - 实现 teacher-forcing next-embedding MSE；
@@ -540,7 +557,8 @@ tests/policies/test_diffusion_jepa.py
 
 验收：
 
-- `jepa_world_model_loss_weight=0` 时能作为共享编码版 Diffusion 稳定训练；
+- residual adapter 初始化时，global condition 与原始 Diffusion 严格一致；
+- `jepa_condition_residual_scale=0` 时始终使用原始 Diffusion condition；
 - shared encoder 同时收到 Diffusion、prediction 和 SIGReg 梯度；
 - target embedding 一侧也有梯度，工程中不存在 EMA target encoder；
 - 改变 clean action 会显著改变 predicted next latent；
@@ -595,6 +613,10 @@ tests/policies/test_diffusion_jepa.py
 - action queue、`reset()` 和 normalization 行为一致；
 - 纯 Diffusion U-Net 权重可按设计加载；
 - save/load 后固定 noise 得到相同输出。
+
+> **Checkpoint 迁移说明：** 当前 residual 结构改变了 condition 的语义，不能继续训练旧版“JEPA latent
+> 硬替换 Diffusion condition”的 checkpoint。旧权重中的 `diffusion_condition_projection` 不会加载到新的
+> `jepa_condition_residual`；请新建 `output_dir` 从头训练，避免把旧 optimizer state 一并恢复。
 
 ### 昇腾 NPU
 
@@ -655,8 +677,9 @@ success_rate
 关键超参数：
 
 ```text
-lambda_world_model = 0.05 / 0.1 / 0.25 / 1.0
+lambda_world_model = 0 / 0.01 / 0.02 / 0.05 / 0.1
 lambda_sigreg = 0.03 / 0.1 / 0.3
+condition_residual_scale = 0 / 0.1 / 1.0
 prediction_horizon = 1 / 2 / 4 / 8
 SIGReg projections = 256 / 512 / 1024
 predictor layers = 2 / 4 / 6
@@ -674,10 +697,11 @@ jepa_predictor_heads = 6
 jepa_predictor_dropout = 0.1
 jepa_prediction_horizon = 4
 
-jepa_world_model_loss_weight = 0.1
+jepa_world_model_loss_weight = 0.02
 jepa_sigreg_weight = 0.1
 jepa_sigreg_num_projections = 512   # 先做 NPU 性能验证
-jepa_loss_ramp_steps = 5000
+jepa_loss_ramp_steps = 20000
+jepa_condition_residual_scale = 0.1
 
 use_jepa_candidate_selection = false
 jepa_num_action_candidates = 8
