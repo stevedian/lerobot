@@ -101,11 +101,13 @@ Phase 2 选出 action chunk 后，仍沿用原始 Diffusion Policy 的固定 act
     RGB camera(s) -> visual backbone -> visual features
     robot state   -> state projection
     env/task info -> optional projection
-    concat + fusion MLP -> z_i
+    concat -> 基础特征 b_i
+        ├── b_i + zero-init policy adapter -> policy latent p_i
+        └── gradient scale -> WM adapter + projector -> WM latent z_i
 
                        ┌──────────────────────────────────────────┐
-z_{t-n+1:t} ---------->│ Diffusion condition projection           │
-                       │ -> conditional 1D U-Net                  │
+p_{t-n+1:t} ---------->│ condition = p + 0.1*tanh(ZeroLinear(z))  │
+z_{t-n+1:t} ---------->│ -> conditional 1D U-Net                  │
 expert action chunk -->│ -> denoising loss L_diffusion            │
                        └──────────────────────────────────────────┘
 
@@ -122,10 +124,10 @@ all z_i
 
 ### 4.2 Shared observation encoder
 
-推荐把共享 encoder 定义为逐时间步编码器：
+推荐把共享 encoder 定义为逐时间步的三输出编码器：
 
 ```text
-z_i = SharedObservationEncoder(
+(b_i, p_i, z_i) = SharedObservationEncoder(
     images_i,
     robot_state_i,
     optional_environment_state_i,
@@ -145,10 +147,13 @@ z_i = SharedObservationEncoder(
 建议融合结构：
 
 ```text
-camera features -> concat
+camera features ─┐
 robot state -> Linear + SiLU
 env/task feature -> Linear + SiLU（如存在）
-all features -> Linear -> BatchNorm/LayerNorm -> z_i
+                 └→ concat -> b_i
+
+b_i -> LayerNorm -> MLP -> zero-init Linear -> residual add -> p_i
+b_i -> gradient scale -> Linear -> SiLU -> LayerNorm -> Linear -> step-wise BatchNorm -> z_i
 ```
 
 初始配置：
@@ -157,24 +162,37 @@ all features -> Linear -> BatchNorm/LayerNorm -> z_i
 jepa_latent_dim = 192
 ```
 
-LeWorldModel 在 ViT 的最终 LayerNorm 后增加 1 层 MLP + BatchNorm，使 SIGReg 能有效塑造输出分布。当前实现也应保留独立 projector，不能直接在已归一化的 backbone 输出上计算 SIGReg。
+LeWorldModel 在 ViT 的最终 LayerNorm 后增加 1 层 MLP + BatchNorm，使 SIGReg 能有效塑造输出分布。当前实现也保留独立 WM projector，并只对 `z_i` 计算 SIGReg。Policy adapter 拥有独立参数空间，用于保留接近任务终点时所需的精细位置与小动作信息；WM 梯度进入共享 backbone 前乘以 `jepa_shared_encoder_gradient_scale`。
 
 ### 4.3 Diffusion 分支
 
-当前 Diffusion Policy 使用最近 `n_obs_steps` 帧作为 U-Net 的 global condition。新模型改成：
+当前 Diffusion Policy 使用最近 `n_obs_steps` 帧的原始特征作为 U-Net global condition。新模型先产生任务专用 policy latent，再融合有界 WM residual：
 
 ```text
-z_history = [z_{t-n+1}, ..., z_t]
-condition = diffusion_condition_proj(z_history)
+b_history = [b_{t-n+1}, ..., b_t]
+p_history = b_history + ZeroInitPolicyAdapter(b_history)
+z_history = WMAdapter(ScaleGradient(b_history))
+
+wm_residual = tanh(ZeroInitLinear(z_history))
+condition = p_history + residual_scale * wm_residual
 global_cond = flatten(condition)
 ```
 
-`diffusion_condition_proj` 的输出宽度应与原始 per-frame condition 宽度一致，因此：
+Policy adapter 的末层和 `wm_to_policy_fusion` 都初始化为零，默认 `residual_scale=0.1`。因此训练开始时：
+
+```text
+policy = base
+condition = base
+```
+
+即严格恢复原始 Diffusion condition。这样：
 
 - `DiffusionConditionalUnet1d.global_cond_dim` 不变；
-- U-Net 结构与纯 Diffusion baseline 一致；
+- U-Net 结构与输入语义在初始化时都与纯 Diffusion baseline 一致；
 - 可以单独加载已有 U-Net 权重；
-- Diffusion loss 的实现保持不变。
+- Diffusion loss 通过 Policy adapter 保留任务专用的精细控制空间；
+- `tanh` 将每个 WM residual 特征限制在 `[-residual_scale, residual_scale]`；
+- 将 `jepa_condition_residual_scale=0` 可单独消融 WM latent 融合，同时保留 Policy adapter。
 
 Diffusion 仍使用 clean action trajectory 加噪后进行 epsilon 或 sample prediction，不把 JEPA latent loss 混入噪声调度器。
 
@@ -211,7 +229,7 @@ jepa_latent_dim = 192
 
 ### 4.5 不使用 target encoder
 
-本方案必须删除以下 ACT-JEPA 风格结构：
+WM predictor 内部不使用以下 ACT-JEPA 风格结构：
 
 ```text
 EMA target encoder
@@ -220,12 +238,14 @@ target encoder update()
 online/target crop synchronization
 ```
 
-训练目标中的 `z_{t+1}` 来自同一个 shared encoder，并且梯度通过预测值和目标值两侧传播：
+训练目标中的 `z_{t+1}` 来自同一个 WM adapter，并且梯度通过预测值和目标值两侧传播。只在 WM 分支进入共享基础特征的位置缩放梯度，不 detach target latent：
 
 ```text
 z_{t+1} = encoder(o_{t+1})
 z_hat_{t+1} = predictor(z_<=t, a_<=t)
 L_pred = MSE(z_hat_{t+1}, z_{t+1})
+
+b_wm = detach(b) + beta * (b - detach(b))
 ```
 
 避免 collapse 的责任由 SIGReg 承担。这是该方案与 ACT-JEPA 最本质的结构区别。
@@ -245,8 +265,8 @@ L_total = L_diffusion + lambda_world_model * L_LeWM
 其中：
 
 ```text
-lambda_sigreg = 0.1       # LeWorldModel 论文默认值
-lambda_world_model = 0.1  # 本项目起始值，需要消融
+lambda_sigreg = 0.1        # LeWorldModel 论文默认值
+lambda_world_model = 0.02  # 保守起始值，降低精细控制梯度冲突
 sigreg_num_projections = 1024
 ```
 
@@ -292,19 +312,19 @@ L_SIGReg = mean_i(L_sigreg_i)
 
 若 1024 个方向在昇腾 NPU 上开销过高，可测试 `256 / 512 / 1024`。论文认为方向数量对性能不敏感，但最终选择必须由本项目吞吐与消融决定。
 
-### 5.4 World-model loss ramp
+### 5.4 World-model loss ramp 与共享梯度
 
 ACT-JEPA 强调联合训练，因此不先单独预训练再冻结 encoder。为降低共享 encoder 初期的梯度冲突，可以只对权重做短 ramp：
 
 ```text
-0 ~ 5K steps:
-    lambda_world_model 从 0 线性增加到 0.1
+0 ~ 20K steps:
+    lambda_world_model 从 0 线性增加到 0.02
 
-5K+ steps:
+20K+ steps:
     完整联合训练，所有模块保持可学习
 ```
 
-同时测试无 ramp 的联合训练版本。最终依据 encoder gradient cosine、Diffusion loss 和成功率选择，而不是默认认为 ramp 必须存在。
+默认 `jepa_shared_encoder_gradient_scale=0.1`：WM adapter 和 predictor 接收完整 world-model 梯度，但该梯度进入共享 `DiffusionRgbEncoder` 时缩小为 10%。同时测试 `0 / 0.05 / 0.1 / 1.0` 和无 ramp 版本。最终依据 encoder gradient cosine、Diffusion loss 和成功率选择，而不是默认认为完全共享梯度一定更好。
 
 ## 6. 数据与时间对齐
 
@@ -439,10 +459,12 @@ class DiffusionJEPAConfig(DiffusionConfig):
     jepa_predictor_dropout: float = 0.1
 
     jepa_prediction_horizon: int = 4
-    jepa_world_model_loss_weight: float = 0.1
+    jepa_world_model_loss_weight: float = 0.02
     jepa_sigreg_weight: float = 0.1
-    jepa_sigreg_num_projections: int = 1024
-    jepa_loss_ramp_steps: int = 5_000
+    jepa_sigreg_num_projections: int = 512
+    jepa_loss_ramp_steps: int = 20_000
+    jepa_shared_encoder_gradient_scale: float = 0.1
+    jepa_condition_residual_scale: float = 0.1
 
     use_jepa_candidate_selection: bool = False
     jepa_num_action_candidates: int = 8
@@ -454,6 +476,7 @@ class DiffusionJEPAConfig(DiffusionConfig):
 - `jepa_latent_dim % jepa_predictor_heads == 0`；
 - prediction/candidate horizon 大于 0，且不越过 Diffusion action horizon；
 - loss weight 非负；
+- shared encoder gradient scale 位于 `[0, 1]`；
 - SIGReg projection 数大于 0；
 - 开启 candidate selection 时 candidate 数至少为 2；
 - 开启 candidate selection 时必须配置有效的 goal/progress scorer。
@@ -530,7 +553,10 @@ tests/policies/test_diffusion_jepa.py
 
 - 新建 `diffusion_jepa` 策略与配置；
 - 实现逐帧 shared observation encoder；
-- Diffusion 使用 shared latent history；
+- 同一次 backbone 前向生成 base feature，并分流到 Policy adapter 与 WM adapter；
+- Policy adapter 使用 zero-init residual 保留精细控制信息；
+- Diffusion 使用 policy latent 加 zero-init、`tanh` 有界的 WM residual；
+- WM 分支进入共享 backbone 的梯度支持独立缩放；
 - 实现 causal Transformer predictor；
 - 在每个 predictor block 中实现 zero-init action AdaLN；
 - 实现 teacher-forcing next-embedding MSE；
@@ -540,7 +566,8 @@ tests/policies/test_diffusion_jepa.py
 
 验收：
 
-- `jepa_world_model_loss_weight=0` 时能作为共享编码版 Diffusion 稳定训练；
+- 两个 task adapter 初始化时，global condition 与原始 Diffusion 严格一致；
+- `jepa_condition_residual_scale=0` 时只使用 policy latent；
 - shared encoder 同时收到 Diffusion、prediction 和 SIGReg 梯度；
 - target embedding 一侧也有梯度，工程中不存在 EMA target encoder；
 - 改变 clean action 会显著改变 predicted next latent；
@@ -594,7 +621,13 @@ tests/policies/test_diffusion_jepa.py
 - Diffusion 输出 shape 与原策略一致；
 - action queue、`reset()` 和 normalization 行为一致；
 - 纯 Diffusion U-Net 权重可按设计加载；
+- zero-init Policy adapter 和 WM fusion 时固定 noise 与纯 Diffusion 输出完全一致；
+- WM residual 每一维不超过配置的 residual scale；
+- gradient scale 不改变前向值，并按配置缩放共享 backbone 梯度；
 - save/load 后固定 noise 得到相同输出。
+
+> **Checkpoint 迁移说明：** 当前双 adapter 与有界融合结构改变了参数名和 condition 语义，不能继续训练
+> 旧版 hard-latent 或 `raw + Linear(z)` checkpoint。请新建 `output_dir` 从头训练，避免恢复旧 optimizer state。
 
 ### 昇腾 NPU
 
@@ -617,6 +650,8 @@ weighted_world_model_loss
 prediction_loss_step_1 ... step_H
 
 latent_feature_std
+policy_adapter_norm
+jepa_condition_residual_norm
 latent_effective_rank
 latent_pairwise_distance
 predictor_action_sensitivity
@@ -655,8 +690,10 @@ success_rate
 关键超参数：
 
 ```text
-lambda_world_model = 0.05 / 0.1 / 0.25 / 1.0
+lambda_world_model = 0 / 0.01 / 0.02 / 0.05 / 0.1
 lambda_sigreg = 0.03 / 0.1 / 0.3
+condition_residual_scale = 0 / 0.1 / 1.0
+shared_encoder_gradient_scale = 0 / 0.05 / 0.1 / 1.0
 prediction_horizon = 1 / 2 / 4 / 8
 SIGReg projections = 256 / 512 / 1024
 predictor layers = 2 / 4 / 6
@@ -674,10 +711,12 @@ jepa_predictor_heads = 6
 jepa_predictor_dropout = 0.1
 jepa_prediction_horizon = 4
 
-jepa_world_model_loss_weight = 0.1
+jepa_world_model_loss_weight = 0.02
 jepa_sigreg_weight = 0.1
 jepa_sigreg_num_projections = 512   # 先做 NPU 性能验证
-jepa_loss_ramp_steps = 5000
+jepa_loss_ramp_steps = 20000
+jepa_shared_encoder_gradient_scale = 0.1
+jepa_condition_residual_scale = 0.1
 
 use_jepa_candidate_selection = false
 jepa_num_action_candidates = 8
