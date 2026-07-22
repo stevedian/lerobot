@@ -47,6 +47,7 @@ class DiffusionJEPAConfig(DiffusionConfig):
     jepa_sigreg_num_projections: int = 512
     jepa_sigreg_num_frequencies: int = 17
     jepa_loss_ramp_steps: int = 20_000
+    jepa_shared_encoder_gradient_scale: float = 0.1
     jepa_condition_residual_scale: float = 0.1
 
     use_jepa_candidate_selection: bool = False
@@ -98,6 +99,8 @@ class DiffusionJEPAConfig(DiffusionConfig):
             raise ValueError("`jepa_sigreg_num_frequencies` must be at least 2.")
         if self.jepa_loss_ramp_steps < 0:
             raise ValueError("`jepa_loss_ramp_steps` must be non-negative.")
+        if not 0 <= self.jepa_shared_encoder_gradient_scale <= 1:
+            raise ValueError("`jepa_shared_encoder_gradient_scale` must be in [0, 1].")
         if self.jepa_condition_residual_scale < 0:
             raise ValueError("`jepa_condition_residual_scale` must be non-negative.")
 
