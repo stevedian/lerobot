@@ -49,12 +49,12 @@ def _stepwise_batch_norm(norm: nn.BatchNorm1d, x: Tensor) -> Tensor:
 
 
 class ActionAdaLNBlock(nn.Module):
-    """Causal Transformer block whose normalization is conditioned on actions."""
+    """Causal Transformer block conditioned on Diffusion latent actions."""
 
     def __init__(self, config: DiffusionJEPAConfig):
         super().__init__()
         dim = config.jepa_latent_dim
-        action_dim = config.action_feature.shape[0]
+        action_dim = config.jepa_action_latent_dim
         mlp_dim = int(dim * config.jepa_predictor_mlp_ratio)
 
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -78,9 +78,9 @@ class ActionAdaLNBlock(nn.Module):
         nn.init.zeros_(modulation.weight)
         nn.init.zeros_(modulation.bias)
 
-    def forward(self, x: Tensor, actions: Tensor, causal_mask: Tensor) -> Tensor:
+    def forward(self, x: Tensor, latent_actions: Tensor, causal_mask: Tensor) -> Tensor:
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = self.action_modulation(
-            actions
+            latent_actions
         ).chunk(6, dim=-1)
 
         attention_input = _modulate(self.norm1(x), shift_attn, scale_attn)
@@ -99,29 +99,35 @@ class ActionAdaLNBlock(nn.Module):
 
 
 class LeWorldModelPredictor(nn.Module):
-    """Action-conditioned causal latent predictor used by Diffusion-JEPA."""
+    """Causal world model conditioned on Diffusion's latent action tokens."""
 
     def __init__(self, config: DiffusionJEPAConfig):
         super().__init__()
         self.config = config
         dim = config.jepa_latent_dim
-        max_sequence_length = max(config.jepa_prediction_horizon, config.jepa_candidate_horizon)
+        max_sequence_length = config.jepa_prediction_horizon
 
         self.position_embedding = nn.Parameter(torch.zeros(1, max_sequence_length, dim))
         nn.init.normal_(self.position_embedding, std=0.02)
+        # This explicit token path gives the alignment loss a non-zero gradient
+        # into Diffusion from the first update. AdaLN below provides additional
+        # per-block conditioning as its zero-initialized modulation learns.
+        self.latent_action_embedding = nn.Linear(config.jepa_action_latent_dim, dim)
         self.blocks = nn.ModuleList([ActionAdaLNBlock(config) for _ in range(config.jepa_predictor_layers)])
         self.final_norm = nn.LayerNorm(dim)
         self.projector = nn.Linear(dim, dim, bias=False)
         self.projector_norm = nn.BatchNorm1d(dim)
 
-    def forward(self, latents: Tensor, actions: Tensor) -> Tensor:
-        """Predict the latent following every aligned ``(latent, action)`` pair."""
-        if latents.ndim != 3 or actions.ndim != 3:
-            raise ValueError("LeWorldModel predictor expects latents and actions shaped (B, T, D).")
-        if latents.shape[:2] != actions.shape[:2]:
+    def forward(self, latents: Tensor, latent_actions: Tensor) -> Tensor:
+        """Predict the latent following every aligned state/latent-action pair."""
+        if latents.ndim != 3 or latent_actions.ndim != 3:
             raise ValueError(
-                "Latent and action sequences must have matching batch/time axes. "
-                f"Got {latents.shape[:2]} and {actions.shape[:2]}."
+                "LeWorldModel predictor expects latents and latent actions shaped (B, T, D)."
+            )
+        if latents.shape[:2] != latent_actions.shape[:2]:
+            raise ValueError(
+                "State and latent-action sequences must have matching batch/time axes. "
+                f"Got {latents.shape[:2]} and {latent_actions.shape[:2]}."
             )
         sequence_length = latents.shape[1]
         if sequence_length > self.position_embedding.shape[1]:
@@ -130,7 +136,11 @@ class LeWorldModelPredictor(nn.Module):
                 f"{self.position_embedding.shape[1]}."
             )
 
-        x = latents + self.position_embedding[:, :sequence_length]
+        x = (
+            latents
+            + self.position_embedding[:, :sequence_length]
+            + self.latent_action_embedding(latent_actions)
+        )
         causal_mask = torch.ones(
             sequence_length,
             sequence_length,
@@ -138,22 +148,7 @@ class LeWorldModelPredictor(nn.Module):
             device=latents.device,
         ).triu(diagonal=1)
         for block in self.blocks:
-            x = block(x, actions, causal_mask)
+            x = block(x, latent_actions, causal_mask)
 
         x = self.projector(self.final_norm(x))
         return _stepwise_batch_norm(self.projector_norm, x)
-
-    def rollout(self, initial_latent: Tensor, actions: Tensor) -> Tensor:
-        """Autoregressively roll out latent states for a clean action sequence."""
-        if initial_latent.ndim != 2 or actions.ndim != 3:
-            raise ValueError("Rollout expects initial_latent (B, D) and actions (B, H, A).")
-        if initial_latent.shape[0] != actions.shape[0]:
-            raise ValueError("Rollout latent and action batch sizes must match.")
-
-        history = initial_latent.unsqueeze(1)
-        predictions = []
-        for step in range(actions.shape[1]):
-            next_latent = self(history, actions[:, : step + 1])[:, -1]
-            predictions.append(next_latent)
-            history = torch.cat([history, next_latent.unsqueeze(1)], dim=1)
-        return torch.stack(predictions, dim=1)

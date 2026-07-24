@@ -37,13 +37,8 @@ from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_pa
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
-def _scale_gradient(value: Tensor, scale: float) -> Tensor:
-    """Keep the forward value while scaling gradients into its producer."""
-    return value.detach() + scale * (value - value.detach())
-
-
-class SharedObservationEncoder(nn.Module):
-    """Produce task-specific policy and world-model latents from one backbone."""
+class DiffusionVisionEncoder(nn.Module):
+    """Observation encoder used exclusively by the Diffusion policy."""
 
     def __init__(self, config: DiffusionJEPAConfig):
         super().__init__()
@@ -62,26 +57,7 @@ class SharedObservationEncoder(nn.Module):
         if config.env_state_feature:
             raw_feature_dim += config.env_state_feature.shape[0]
 
-        self.raw_feature_dim = raw_feature_dim
-        self.policy_adapter = nn.Sequential(
-            nn.LayerNorm(raw_feature_dim),
-            nn.Linear(raw_feature_dim, raw_feature_dim),
-            nn.SiLU(),
-            nn.Linear(raw_feature_dim, raw_feature_dim),
-        )
-        # Preserve the exact Diffusion Policy features at initialization.
-        nn.init.zeros_(self.policy_adapter[-1].weight)
-        nn.init.zeros_(self.policy_adapter[-1].bias)
-
-        self.wm_adapter = nn.Sequential(
-            nn.Linear(raw_feature_dim, config.jepa_latent_dim),
-            nn.SiLU(),
-            nn.LayerNorm(config.jepa_latent_dim),
-        )
-        # LeWorldModel places a one-layer MLP + BatchNorm projector after the
-        # backbone normalization so SIGReg can shape the output distribution.
-        self.wm_projector = nn.Linear(config.jepa_latent_dim, config.jepa_latent_dim, bias=False)
-        self.wm_projector_norm = nn.BatchNorm1d(config.jepa_latent_dim)
+        self.feature_dim = raw_feature_dim
 
     def _encode_images(self, images: Tensor, batch_size: int, sequence_length: int) -> Tensor:
         if self.config.use_separate_rgb_encoder_per_camera:
@@ -107,8 +83,8 @@ class SharedObservationEncoder(nn.Module):
             s=sequence_length,
         )
 
-    def encode_raw_features(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return the uncompressed per-step condition used by Diffusion Policy."""
+    def forward(self, batch: dict[str, Tensor]) -> Tensor:
+        """Return per-step features used as Diffusion global conditioning."""
         state = batch[OBS_STATE]
         if state.ndim != 3:
             raise ValueError(f"Expected `{OBS_STATE}` shaped (B, T, D). Got {state.shape}.")
@@ -125,50 +101,43 @@ class SharedObservationEncoder(nn.Module):
 
         return torch.cat(features, dim=-1)
 
-    def adapt_policy_features(self, base_features: Tensor) -> Tensor:
-        """Keep fine control features through a zero-initialized residual adapter."""
-        return base_features + self.policy_adapter(base_features)
 
-    def project_to_jepa_latent(self, base_features: Tensor) -> Tensor:
-        """Project shared features into the SIGReg-regularized world-model space."""
-        wm_features = _scale_gradient(
-            base_features,
-            self.config.jepa_shared_encoder_gradient_scale,
+class JEPAEncoder(DiffusionVisionEncoder):
+    """Independent training-only encoder for current and future JEPA states."""
+
+    def __init__(self, config: DiffusionJEPAConfig):
+        super().__init__(config)
+        self.adapter = nn.Sequential(
+            nn.Linear(self.feature_dim, config.jepa_latent_dim),
+            nn.SiLU(),
+            nn.LayerNorm(config.jepa_latent_dim),
         )
-        adapted = self.wm_adapter(wm_features)
-        projected = self.wm_projector(adapted)
-        return _stepwise_batch_norm(self.wm_projector_norm, projected)
-
-    def forward_with_branches(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
-        """Return ``(base_features, policy_features, world_model_latents)``."""
-        base_features = self.encode_raw_features(batch)
-        policy_features = self.adapt_policy_features(base_features)
-        wm_latents = self.project_to_jepa_latent(base_features)
-        return base_features, policy_features, wm_latents
+        self.projector = nn.Linear(config.jepa_latent_dim, config.jepa_latent_dim, bias=False)
+        self.projector_norm = nn.BatchNorm1d(config.jepa_latent_dim)
 
     def forward(self, batch: dict[str, Tensor]) -> Tensor:
-        """Return world-model latents for goal encoding and candidate scoring."""
-        return self.forward_with_branches(batch)[2]
+        features = super().forward(batch)
+        projected = self.projector(self.adapter(features))
+        return _stepwise_batch_norm(self.projector_norm, projected)
 
 
 class DiffusionJEPAModel(nn.Module):
-    """Diffusion action generator and LeWorldModel sharing one observation encoder."""
+    """Diffusion action policy with a training-only LeWorldModel objective."""
 
     def __init__(self, config: DiffusionJEPAConfig):
         super().__init__()
         self.config = config
-        self.observation_encoder = SharedObservationEncoder(config)
-        self.wm_to_policy_fusion = nn.Linear(
-            config.jepa_latent_dim,
-            self.observation_encoder.raw_feature_dim,
-        )
-        # Keep fusion equal to the policy latent at initialization. Tanh bounds
-        # the later world-model correction in normalized feature coordinates.
-        nn.init.zeros_(self.wm_to_policy_fusion.weight)
-        nn.init.zeros_(self.wm_to_policy_fusion.bias)
+        self.vision_encoder = DiffusionVisionEncoder(config)
+        self.jepa_encoder = JEPAEncoder(config)
         self.unet = DiffusionConditionalUnet1d(
             config,
-            global_cond_dim=self.observation_encoder.raw_feature_dim * config.n_obs_steps,
+            global_cond_dim=self.vision_encoder.feature_dim * config.n_obs_steps,
+        )
+        self.latent_action_head = nn.Sequential(
+            nn.LayerNorm(config.down_dims[0]),
+            nn.Linear(config.down_dims[0], config.jepa_action_latent_dim),
+            nn.SiLU(),
+            nn.Linear(config.jepa_action_latent_dim, config.jepa_action_latent_dim),
         )
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -193,21 +162,14 @@ class DiffusionJEPAModel(nn.Module):
         )
         self.register_buffer("num_updates", torch.zeros((), dtype=torch.long))
 
-    def _prepare_global_conditioning(self, policy_features: Tensor, wm_latents: Tensor) -> Tensor:
-        """Fuse policy and world-model latents with a bounded residual."""
-        if wm_latents.shape[1] < self.config.n_obs_steps:
+    def _prepare_global_conditioning(self, policy_features: Tensor) -> Tensor:
+        """Flatten policy history without depending on the JEPA branch."""
+        if policy_features.shape[1] < self.config.n_obs_steps:
             raise ValueError(
                 f"Diffusion-JEPA needs {self.config.n_obs_steps} observation steps. "
-                f"Got {wm_latents.shape[1]}."
+                f"Got {policy_features.shape[1]}."
             )
-        if policy_features.shape[:2] != wm_latents.shape[:2]:
-            raise ValueError("Policy features and world-model latents must have matching batch/time axes.")
-        policy_history = policy_features[:, : self.config.n_obs_steps]
-        wm_history = wm_latents[:, : self.config.n_obs_steps]
-        wm_residual = self.config.jepa_condition_residual_scale * torch.tanh(
-            self.wm_to_policy_fusion(wm_history)
-        )
-        return (policy_history + wm_residual).flatten(start_dim=1)
+        return policy_features[:, : self.config.n_obs_steps].flatten(start_dim=1)
 
     def conditional_sample(
         self,
@@ -253,120 +215,13 @@ class DiffusionJEPAModel(nn.Module):
         return sample
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        _, policy_features, wm_latents = self.observation_encoder.forward_with_branches(batch)
-        global_cond = self._prepare_global_conditioning(policy_features, wm_latents)
-        trajectory = self.conditional_sample(wm_latents.shape[0], global_cond, noise=noise)
+        # The deployed path deliberately never evaluates the JEPA encoder,
+        # latent-action head, world model, or SIGReg modules.
+        policy_features = self.vision_encoder(batch)
+        global_cond = self._prepare_global_conditioning(policy_features)
+        trajectory = self.conditional_sample(policy_features.shape[0], global_cond, noise=noise)
         start = self.config.n_obs_steps - 1
         return trajectory[:, start : start + self.config.n_action_steps]
-
-    def generate_action_candidates(
-        self,
-        batch: dict[str, Tensor],
-        num_candidates: int | None = None,
-        noise: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Return executed action candidates and the current shared latent."""
-        candidate_count = self.config.jepa_num_action_candidates if num_candidates is None else num_candidates
-        if candidate_count < 1:
-            raise ValueError("At least one candidate is required.")
-
-        _, policy_features, wm_latents = self.observation_encoder.forward_with_branches(batch)
-        current_latent = wm_latents[:, self.config.n_obs_steps - 1]
-        global_cond = self._prepare_global_conditioning(
-            policy_features,
-            wm_latents,
-        ).repeat_interleave(candidate_count, dim=0)
-        batch_size = wm_latents.shape[0]
-
-        flat_noise = None
-        if noise is not None:
-            if noise.ndim == 4:
-                expected_prefix = (batch_size, candidate_count)
-                if noise.shape[:2] != expected_prefix:
-                    raise ValueError(
-                        f"Candidate noise must start with {expected_prefix}. Got {noise.shape[:2]}."
-                    )
-                flat_noise = noise.flatten(0, 1)
-            else:
-                flat_noise = noise
-
-        trajectories = self.conditional_sample(
-            batch_size * candidate_count,
-            global_cond,
-            noise=flat_noise,
-        ).reshape(batch_size, candidate_count, self.config.horizon, -1)
-        start = self.config.n_obs_steps - 1
-        chunks = trajectories[:, :, start : start + self.config.n_action_steps]
-        return chunks, current_latent
-
-    def rollout_action_candidates(self, initial_latent: Tensor, candidates: Tensor) -> Tensor:
-        if candidates.ndim != 4:
-            raise ValueError("Action candidates must be shaped (B, K, H, A).")
-        batch_size, candidate_count, horizon = candidates.shape[:3]
-        if horizon < 1 or candidates.shape[-1] != self.config.action_feature.shape[0]:
-            raise ValueError("Action candidates have an incompatible horizon or action dimension.")
-        if initial_latent.shape != (batch_size, self.config.jepa_latent_dim):
-            raise ValueError("Initial candidate latent has an incompatible shape.")
-        flat_latent = initial_latent.repeat_interleave(candidate_count, dim=0)
-        flat_actions = candidates.flatten(0, 1)
-        rollout = self.world_model_predictor.rollout(flat_latent, flat_actions)
-        return rollout.reshape(batch_size, candidate_count, horizon, -1)
-
-    def score_action_candidates(
-        self,
-        initial_latent: Tensor,
-        candidates: Tensor,
-        goal_latent: Tensor,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Score candidates against an explicit goal; lower is better."""
-        horizon = self.config.jepa_candidate_horizon
-        if candidates.shape[2] < horizon:
-            raise ValueError(
-                f"Candidate chunk has {candidates.shape[2]} steps, but scoring requires {horizon}."
-            )
-        rollout = self.rollout_action_candidates(initial_latent, candidates[:, :, :horizon])
-        if goal_latent.ndim == 1:
-            goal_latent = goal_latent.unsqueeze(0).expand_as(initial_latent)
-        if goal_latent.shape != initial_latent.shape:
-            raise ValueError(f"Goal latent must have shape {initial_latent.shape}. Got {goal_latent.shape}.")
-
-        goal_cost = (rollout[:, :, -1] - goal_latent[:, None]).square().mean(dim=-1)
-        if horizon > 1:
-            smoothness_cost = candidates[:, :, 1:horizon].sub(candidates[:, :, : horizon - 1]).square()
-            smoothness_cost = smoothness_cost.mean(dim=(-1, -2))
-        else:
-            smoothness_cost = torch.zeros_like(goal_cost)
-        action_bound_cost = F.relu(candidates[:, :, :horizon].abs() - 1).square().mean(dim=(-1, -2))
-        total = (
-            self.config.jepa_goal_weight * goal_cost
-            + self.config.jepa_smoothness_weight * smoothness_cost
-            + self.config.jepa_action_bound_weight * action_bound_cost
-        )
-        return total, {
-            "goal_cost": goal_cost,
-            "smoothness_cost": smoothness_cost,
-            "action_bound_cost": action_bound_cost,
-            "latent_rollout": rollout,
-        }
-
-    def select_action_candidate(
-        self,
-        batch: dict[str, Tensor],
-        goal_latent: Tensor,
-        noise: Tensor | None = None,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        candidates, current_latent = self.generate_action_candidates(batch, noise=noise)
-        scores, diagnostics = self.score_action_candidates(current_latent, candidates, goal_latent)
-        selected_index = scores.argmin(dim=1)
-        gather_index = selected_index[:, None, None, None].expand(
-            -1,
-            1,
-            candidates.shape[2],
-            candidates.shape[3],
-        )
-        selected = candidates.gather(1, gather_index).squeeze(1)
-        diagnostics.update({"scores": scores, "selected_index": selected_index})
-        return selected, diagnostics
 
     def _observation_valid_mask(self, batch: dict[str, Tensor], sequence_length: int) -> Tensor:
         masks = []
@@ -385,7 +240,13 @@ class DiffusionJEPAModel(nn.Module):
             device=batch[OBS_STATE].device,
         )
 
-    def _diffusion_loss(self, batch: dict[str, Tensor], global_cond: Tensor) -> Tensor:
+    def _diffusion_loss(
+        self,
+        batch: dict[str, Tensor],
+        global_cond: Tensor,
+        *,
+        return_latent_actions: bool,
+    ) -> tuple[Tensor, Tensor | None]:
         trajectory = batch[ACTION]
         noise = torch.randn_like(trajectory)
         timesteps = torch.randint(
@@ -395,12 +256,22 @@ class DiffusionJEPAModel(nn.Module):
             device=trajectory.device,
         ).long()
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
-        prediction = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        if return_latent_actions:
+            prediction, denoising_features = self.unet(
+                noisy_trajectory,
+                timesteps,
+                global_cond=global_cond,
+                return_features=True,
+            )
+            latent_actions = self.latent_action_head(denoising_features)
+        else:
+            prediction = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+            latent_actions = None
         target = noise if self.config.prediction_type == "epsilon" else trajectory
         loss = F.mse_loss(prediction, target, reduction="none")
         if self.config.do_mask_loss_for_padding:
             loss = loss * (~batch["action_is_pad"]).unsqueeze(-1)
-        return loss.mean()
+        return loss.mean(), latent_actions
 
     def _current_world_model_weight(self) -> float:
         if self.config.jepa_loss_ramp_steps == 0:
@@ -416,30 +287,37 @@ class DiffusionJEPAModel(nn.Module):
         if batch[ACTION].shape[1] != self.config.horizon:
             raise ValueError("Training action horizon does not match the policy config.")
 
-        base_features, policy_features, wm_latents = self.observation_encoder.forward_with_branches(batch)
-        global_cond = self._prepare_global_conditioning(policy_features, wm_latents)
-        diffusion_loss = self._diffusion_loss(batch, global_cond)
+        policy_features = self.vision_encoder(batch)
+        global_cond = self._prepare_global_conditioning(policy_features)
         world_weight = self._current_world_model_weight()
+        diffusion_loss, latent_actions = self._diffusion_loss(
+            batch,
+            global_cond,
+            return_latent_actions=self.config.jepa_world_model_loss_weight > 0,
+        )
         if self.config.jepa_world_model_loss_weight == 0:
             return diffusion_loss, {
                 "diffusion_loss": diffusion_loss.item(),
                 "world_model_weight": 0.0,
             }
 
+        if latent_actions is None:
+            raise RuntimeError("JEPA training requires Diffusion latent actions.")
+        jepa_latents = self.jepa_encoder(batch)
         current_index = self.config.n_obs_steps - 1
         end_index = current_index + self.config.jepa_prediction_horizon + 1
-        if wm_latents.shape[1] < end_index:
+        if jepa_latents.shape[1] < end_index:
             raise ValueError(
                 "Training observations do not contain all JEPA future targets. "
-                f"Need {end_index} steps, got {wm_latents.shape[1]}."
+                f"Need {end_index} steps, got {jepa_latents.shape[1]}."
             )
-        world_latents = wm_latents[:, current_index:end_index]
+        world_latents = jepa_latents[:, current_index:end_index]
         action_start = self.config.n_obs_steps - 1
-        world_actions = batch[ACTION][
+        world_latent_actions = latent_actions[
             :,
             action_start : action_start + self.config.jepa_prediction_horizon,
         ]
-        predicted_next = self.world_model_predictor(world_latents[:, :-1], world_actions)
+        predicted_next = self.world_model_predictor(world_latents[:, :-1], world_latent_actions)
 
         observation_valid = self._observation_valid_mask(batch, end_index)[:, current_index:end_index]
         action_valid = ~batch["action_is_pad"][
@@ -464,26 +342,7 @@ class DiffusionJEPAModel(nn.Module):
             "weighted_world_model_loss": (world_weight * world_model_loss).item(),
             "world_model_weight": world_weight,
             "latent_feature_std": world_latents.detach().float().std(dim=(0, 1)).mean().item(),
-            "policy_adapter_norm": (
-                policy_features[:, : self.config.n_obs_steps].detach()
-                - base_features[:, : self.config.n_obs_steps].detach()
-            )
-            .float()
-            .norm(dim=-1)
-            .mean()
-            .item(),
-            "jepa_condition_residual_norm": (
-                global_cond.detach().reshape(
-                    policy_features.shape[0],
-                    self.config.n_obs_steps,
-                    policy_features.shape[-1],
-                )
-                - policy_features[:, : self.config.n_obs_steps].detach()
-            )
-            .float()
-            .norm(dim=-1)
-            .mean()
-            .item(),
+            "latent_action_norm": world_latent_actions.detach().float().norm(dim=-1).mean().item(),
         }
         for step in range(per_transition_loss.shape[1]):
             step_valid = transition_valid[:, step]
@@ -499,7 +358,7 @@ class DiffusionJEPAModel(nn.Module):
 
 
 class DiffusionJEPAPolicy(PreTrainedPolicy):
-    """Diffusion Policy with a jointly trained LeWorldModel latent world model."""
+    """Diffusion Policy trained with an auxiliary LeWorldModel objective."""
 
     config_class = DiffusionJEPAConfig
     name = "diffusion_jepa"
@@ -509,7 +368,6 @@ class DiffusionJEPAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.diffusion_jepa = DiffusionJEPAModel(config)
-        self._goal_latent: Tensor | None = None
         self.reset()
 
     def get_optim_params(self):
@@ -524,29 +382,6 @@ class DiffusionJEPAPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
-        self._goal_latent = None
-
-    def set_goal_latent(self, goal_latent: Tensor) -> None:
-        """Set an explicit goal latent required by candidate selection."""
-        self._goal_latent = goal_latent
-
-    @torch.no_grad()
-    def encode_goal_observation(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode a goal observation so it can be passed to ``set_goal_latent``."""
-        temporal_batch = self._stack_images(dict(batch))
-        for key in (OBS_STATE, OBS_ENV_STATE, OBS_IMAGES):
-            if key not in temporal_batch:
-                continue
-            value = temporal_batch[key]
-            feature_rank = 1 if key in (OBS_STATE, OBS_ENV_STATE) else 4
-            if value.ndim == feature_rank + 1:
-                temporal_batch[key] = value.unsqueeze(1)
-        return self.diffusion_jepa.observation_encoder(temporal_batch)[:, -1]
-
-    @torch.no_grad()
-    def set_goal_observation(self, batch: dict[str, Tensor]) -> None:
-        """Encode and store an explicit goal observation for candidate selection."""
-        self.set_goal_latent(self.encode_goal_observation(batch))
 
     def _stack_images(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if not self.config.image_features:
@@ -560,17 +395,6 @@ class DiffusionJEPAPolicy(PreTrainedPolicy):
         queued_batch = {
             key: torch.stack(list(self._queues[key]), dim=1) for key in batch if key in self._queues
         }
-        if self.config.use_jepa_candidate_selection:
-            if self._goal_latent is None:
-                raise ValueError(
-                    "JEPA candidate selection requires an explicit goal. Call `set_goal_latent` first."
-                )
-            actions, _ = self.diffusion_jepa.select_action_candidate(
-                queued_batch,
-                self._goal_latent.to(queued_batch[OBS_STATE]),
-                noise=noise,
-            )
-            return actions
         return self.diffusion_jepa.generate_actions(queued_batch, noise=noise)
 
     @torch.no_grad()

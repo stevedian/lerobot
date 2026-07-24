@@ -23,7 +23,6 @@ from lerobot.policies.diffusion_jepa.configuration_diffusion_jepa import Diffusi
 from lerobot.policies.diffusion_jepa.modeling_diffusion_jepa import (
     DiffusionJEPAModel,
     DiffusionJEPAPolicy,
-    _scale_gradient,
 )
 from lerobot.policies.diffusion_jepa.sigreg import SIGReg
 from lerobot.policies.factory import get_policy_class, make_policy_config
@@ -51,15 +50,12 @@ def _make_config(**overrides) -> DiffusionJEPAConfig:
         "jepa_predictor_mlp_ratio": 2.0,
         "jepa_predictor_dropout": 0.0,
         "jepa_prediction_horizon": 2,
+        "jepa_action_latent_dim": 8,
         "jepa_world_model_loss_weight": 0.1,
         "jepa_sigreg_weight": 0.1,
         "jepa_sigreg_num_projections": 16,
         "jepa_sigreg_num_frequencies": 5,
         "jepa_loss_ramp_steps": 0,
-        "jepa_num_action_candidates": 3,
-        "jepa_candidate_horizon": 2,
-        "jepa_smoothness_weight": 0.0,
-        "jepa_action_bound_weight": 0.0,
         "device": "cpu",
     }
     kwargs.update(overrides)
@@ -86,15 +82,13 @@ def test_config_requests_history_and_future_observations() -> None:
 
     with pytest.raises(ValueError, match="divisible"):
         _make_config(jepa_latent_dim=10)
-    with pytest.raises(ValueError, match="executed action chunk"):
-        _make_config(jepa_candidate_horizon=3)
-    with pytest.raises(ValueError, match="residual_scale"):
-        _make_config(jepa_condition_residual_scale=-0.1)
-    with pytest.raises(ValueError, match="gradient_scale"):
-        _make_config(jepa_shared_encoder_gradient_scale=1.1)
+    with pytest.raises(ValueError, match="action_latent_dim"):
+        _make_config(jepa_action_latent_dim=0)
+    with pytest.raises(ValueError, match="training-only"):
+        _make_config(use_jepa_candidate_selection=True)
 
 
-def test_joint_loss_backpropagates_through_one_shared_encoder() -> None:
+def test_joint_loss_connects_diffusion_latent_action_to_independent_jepa_branch() -> None:
     model = DiffusionJEPAModel(_make_config())
     model.train()
     loss, metrics = model.compute_loss(_make_batch())
@@ -106,84 +100,36 @@ def test_joint_loss_backpropagates_through_one_shared_encoder() -> None:
             "lewm_prediction_loss",
             "sigreg_loss",
             "latent_feature_std",
-            "policy_adapter_norm",
-            "jepa_condition_residual_norm",
+            "latent_action_norm",
         }
     )
-    assert metrics["policy_adapter_norm"] == 0
-    assert metrics["jepa_condition_residual_norm"] == 0
-    assert any(parameter.grad is not None for parameter in model.observation_encoder.parameters())
+    assert model.vision_encoder is not model.jepa_encoder
+    assert any(parameter.grad is not None for parameter in model.jepa_encoder.parameters())
     assert any(parameter.grad is not None for parameter in model.world_model_predictor.parameters())
-    assert model.observation_encoder.policy_adapter[-1].weight.grad is not None
-    assert model.observation_encoder.policy_adapter[-1].weight.grad.abs().sum() > 0
-    assert model.wm_to_policy_fusion.weight.grad is not None
-    assert model.wm_to_policy_fusion.weight.grad.abs().sum() > 0
+    assert model.latent_action_head[-1].weight.grad is not None
+    assert model.latent_action_head[-1].weight.grad.abs().sum() > 0
     assert not any("target_encoder" in name for name, _ in model.named_modules())
 
 
-def test_zero_initialized_task_adapters_preserve_baseline_condition() -> None:
+def test_jepa_encoder_never_changes_diffusion_condition() -> None:
     model = DiffusionJEPAModel(_make_config())
     model.eval()
     batch = _make_batch()
-    base_features, policy_features, wm_latents = model.observation_encoder.forward_with_branches(batch)
+    policy_features = model.vision_encoder(batch)
+    global_condition = model._prepare_global_conditioning(policy_features)
+    expected_condition = policy_features[:, : model.config.n_obs_steps].flatten(start_dim=1)
+    torch.testing.assert_close(global_condition, expected_condition)
 
-    global_condition = model._prepare_global_conditioning(policy_features, wm_latents)
-    expected_baseline_condition = base_features[:, : model.config.n_obs_steps].flatten(start_dim=1)
-
-    torch.testing.assert_close(policy_features, base_features)
-    torch.testing.assert_close(global_condition, expected_baseline_condition)
-    assert torch.count_nonzero(model.observation_encoder.policy_adapter[-1].weight) == 0
-    assert torch.count_nonzero(model.observation_encoder.policy_adapter[-1].bias) == 0
-    assert torch.count_nonzero(model.wm_to_policy_fusion.weight) == 0
-    assert torch.count_nonzero(model.wm_to_policy_fusion.bias) == 0
-
-
-def test_world_model_latent_is_fused_as_bounded_policy_residual() -> None:
-    model = DiffusionJEPAModel(_make_config())
-    model.eval()
-    batch = _make_batch()
-    _, policy_features, wm_latents = model.observation_encoder.forward_with_branches(batch)
     with torch.no_grad():
-        model.wm_to_policy_fusion.weight.fill_(0.01)
-        model.wm_to_policy_fusion.bias.fill_(0.02)
+        for parameter in model.jepa_encoder.parameters():
+            parameter.normal_()
+        for parameter in model.world_model_predictor.parameters():
+            parameter.normal_()
 
-    global_condition = model._prepare_global_conditioning(policy_features, wm_latents)
-    residual = torch.tanh(model.wm_to_policy_fusion(wm_latents[:, : model.config.n_obs_steps]))
-    expected = (
-        policy_features[:, : model.config.n_obs_steps] + model.config.jepa_condition_residual_scale * residual
-    ).flatten(start_dim=1)
-    torch.testing.assert_close(global_condition, expected)
-
-    condition_steps = global_condition.reshape_as(policy_features[:, : model.config.n_obs_steps])
-    condition_delta = condition_steps - policy_features[:, : model.config.n_obs_steps]
-    assert condition_delta.abs().max() <= model.config.jepa_condition_residual_scale
+    torch.testing.assert_close(model._prepare_global_conditioning(policy_features), global_condition)
 
 
-def test_zero_residual_scale_keeps_exact_baseline_condition() -> None:
-    model = DiffusionJEPAModel(_make_config(jepa_condition_residual_scale=0.0))
-    model.eval()
-    batch = _make_batch()
-    with torch.no_grad():
-        model.observation_encoder.policy_adapter[-1].bias.fill_(0.05)
-        model.wm_to_policy_fusion.weight.normal_()
-        model.wm_to_policy_fusion.bias.normal_()
-    _, policy_features, wm_latents = model.observation_encoder.forward_with_branches(batch)
-
-    global_condition = model._prepare_global_conditioning(policy_features, wm_latents)
-    expected = policy_features[:, : model.config.n_obs_steps].flatten(start_dim=1)
-    torch.testing.assert_close(global_condition, expected)
-
-
-def test_shared_encoder_gradient_scaling_preserves_values_and_scales_gradients() -> None:
-    value = torch.randn(2, 3, requires_grad=True)
-    scaled = _scale_gradient(value, 0.1)
-
-    torch.testing.assert_close(scaled, value)
-    scaled.sum().backward()
-    torch.testing.assert_close(value.grad, torch.full_like(value, 0.1))
-
-
-def test_zero_initialized_residual_matches_diffusion_actions_with_shared_unet() -> None:
+def test_diffusion_only_path_matches_baseline_with_same_unet() -> None:
     config = _make_config(num_inference_steps=2)
     baseline = DiffusionModel(config)
     model = DiffusionJEPAModel(config)
@@ -204,24 +150,61 @@ def test_zero_initialized_residual_matches_diffusion_actions_with_shared_unet() 
     torch.testing.assert_close(baseline_actions, jepa_actions, rtol=0, atol=0)
 
 
-def test_world_model_uses_actions_starting_at_current_timestep() -> None:
+def test_action_generation_does_not_evaluate_jepa_modules() -> None:
+    model = DiffusionJEPAModel(_make_config())
+    model.eval()
+    batch = {
+        OBS_STATE: torch.randn(2, model.config.n_obs_steps, 3),
+        OBS_ENV_STATE: torch.randn(2, model.config.n_obs_steps, 6),
+    }
+    noise = torch.randn(2, model.config.horizon, 2)
+    called = []
+
+    hooks = [
+        module.register_forward_hook(lambda _module, _inputs, _output, name=name: called.append(name))
+        for name, module in {
+            "jepa_encoder": model.jepa_encoder,
+            "latent_action_head": model.latent_action_head,
+            "world_model_predictor": model.world_model_predictor,
+            "sigreg": model.sigreg,
+        }.items()
+    ]
+    try:
+        model.generate_actions(batch, noise=noise)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    assert called == []
+
+
+def test_world_model_uses_diffusion_latent_actions_starting_at_current_timestep() -> None:
     model = DiffusionJEPAModel(_make_config())
     batch = _make_batch()
-    captured_actions = None
+    head_output = None
+    predictor_input = None
 
-    def capture_actions(_module, inputs, _output):
-        nonlocal captured_actions
-        captured_actions = inputs[1].detach().clone()
+    def capture_head(_module, _inputs, output):
+        nonlocal head_output
+        head_output = output.detach().clone()
 
-    hook = model.world_model_predictor.register_forward_hook(capture_actions)
+    def capture_predictor(_module, inputs, _output):
+        nonlocal predictor_input
+        predictor_input = inputs[1].detach().clone()
+
+    head_hook = model.latent_action_head.register_forward_hook(capture_head)
+    predictor_hook = model.world_model_predictor.register_forward_hook(capture_predictor)
     model.compute_loss(batch)
-    hook.remove()
+    head_hook.remove()
+    predictor_hook.remove()
 
-    assert captured_actions is not None
-    torch.testing.assert_close(captured_actions, batch[ACTION][:, 1:3])
+    assert head_output is not None
+    assert predictor_input is not None
+    torch.testing.assert_close(predictor_input, head_output[:, 1:3])
+    assert predictor_input.shape[-1] == model.config.jepa_action_latent_dim
 
 
-def test_shared_encoder_does_not_leak_future_through_batch_norm() -> None:
+def test_jepa_encoder_does_not_leak_future_through_batch_norm() -> None:
     model = DiffusionJEPAModel(_make_config())
     model.train()
     batch = _make_batch()
@@ -230,23 +213,23 @@ def test_shared_encoder_does_not_leak_future_through_batch_norm() -> None:
     changed_batch[OBS_ENV_STATE][:, 2:] -= 100
 
     torch.manual_seed(0)
-    original = model.observation_encoder(batch)
+    original = model.jepa_encoder(batch)
     torch.manual_seed(0)
-    changed = model.observation_encoder(changed_batch)
+    changed = model.jepa_encoder(changed_batch)
     torch.testing.assert_close(original[:, :2], changed[:, :2])
 
 
-def test_predictor_is_causal_and_action_adaln_learns() -> None:
+def test_predictor_is_causal_and_latent_action_adaln_learns() -> None:
     model = DiffusionJEPAModel(_make_config())
     predictor = model.world_model_predictor
     predictor.eval()
     latents = torch.randn(2, 2, 12)
-    actions = torch.randn(2, 2, 2, requires_grad=True)
+    latent_actions = torch.randn(2, 2, 8, requires_grad=True)
 
-    original = predictor(latents, actions)
+    original = predictor(latents, latent_actions)
     changed_latents = latents.clone()
     changed_latents[:, 1] += 100
-    changed = predictor(changed_latents, actions)
+    changed = predictor(changed_latents, latent_actions)
     torch.testing.assert_close(original[:, 0], changed[:, 0])
 
     original.square().mean().backward()
@@ -273,27 +256,6 @@ def test_sigreg_penalizes_collapse_and_has_finite_gradients() -> None:
     assert embeddings.grad is not None
     assert torch.isfinite(embeddings.grad).all()
     assert embeddings.grad.abs().sum() > 0
-
-
-def test_candidate_rollout_and_goal_scoring_are_batched() -> None:
-    model = DiffusionJEPAModel(_make_config())
-    model.eval()
-    # Break the intentional zero action-conditioning initialization so this unit
-    # test can construct candidates with distinct predicted consequences.
-    with torch.no_grad():
-        for block in model.world_model_predictor.blocks:
-            block.action_modulation[-1].weight.normal_(std=0.1)
-
-    initial_latent = torch.randn(2, 12)
-    candidates = torch.randn(2, 3, 2, 2).clamp(-1, 1)
-    rollout = model.rollout_action_candidates(initial_latent, candidates)
-    assert rollout.shape == (2, 3, 2, 12)
-
-    goal = rollout[:, 0, -1]
-    scores, diagnostics = model.score_action_candidates(initial_latent, candidates, goal)
-    assert scores.shape == (2, 3)
-    assert diagnostics["latent_rollout"].shape == (2, 3, 2, 12)
-    assert torch.equal(scores.argmin(dim=1), torch.zeros(2, dtype=torch.long))
 
 
 def test_loss_weight_ramp_is_checkpointed_in_model_state() -> None:
@@ -325,24 +287,7 @@ def test_policy_factory_and_inference_action_queue(tmp_path) -> None:
     assert loaded.diffusion_jepa.num_updates.item() == policy.diffusion_jepa.num_updates.item()
 
 
-def test_candidate_selection_requires_and_accepts_explicit_goal() -> None:
-    policy = DiffusionJEPAPolicy(_make_config(use_jepa_candidate_selection=True))
-    policy.eval()
-    observation = {
-        OBS_STATE: torch.randn(2, 3),
-        OBS_ENV_STATE: torch.randn(2, 6),
-    }
-    noise = torch.randn(2, 3, 4, 2)
-    with pytest.raises(ValueError, match="explicit goal"):
-        policy.select_action(observation, noise=noise)
-
-    policy.reset()
-    policy.set_goal_observation(observation)
-    action = policy.select_action(observation, noise=noise)
-    assert action.shape == (2, 2)
-
-
-def test_image_observations_use_the_shared_encoder() -> None:
+def test_image_observations_use_separate_policy_and_jepa_encoders() -> None:
     image_key = "observation.images.front"
     config = _make_config(
         input_features={
@@ -352,6 +297,10 @@ def test_image_observations_use_the_shared_encoder() -> None:
         crop_shape=None,
     )
     policy = DiffusionJEPAPolicy(config)
+    assert policy.diffusion_jepa.vision_encoder.rgb_encoder is not policy.diffusion_jepa.jepa_encoder.rgb_encoder
+    policy_parameter_ids = {id(parameter) for parameter in policy.diffusion_jepa.vision_encoder.parameters()}
+    jepa_parameter_ids = {id(parameter) for parameter in policy.diffusion_jepa.jepa_encoder.parameters()}
+    assert policy_parameter_ids.isdisjoint(jepa_parameter_ids)
     batch = _make_batch(batch_size=2)
     batch.pop(OBS_ENV_STATE)
     batch.pop(f"{OBS_ENV_STATE}_is_pad")
