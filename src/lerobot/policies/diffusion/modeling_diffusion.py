@@ -661,15 +661,23 @@ class DiffusionConditionalUnet1d(nn.Module):
             nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
         )
 
-    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        timestep: Tensor | int,
+        global_cond=None,
+        *,
+        return_features: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """
         Args:
             x: (B, T, input_dim) tensor for input to the Unet.
             timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
             global_cond: (B, global_cond_dim)
-            output: (B, T, input_dim)
+            return_features: Also return the full-resolution decoder features
+                immediately before the final action projection.
         Returns:
-            (B, T, input_dim) diffusion model prediction.
+            Diffusion model prediction, optionally paired with decoder features.
         """
         # For 1D convolutions we'll need feature dimension first.
         x = einops.rearrange(x, "b t d -> b d t")
@@ -700,10 +708,11 @@ class DiffusionConditionalUnet1d(nn.Module):
             x = resnet2(x, global_feature)
             x = upsample(x)
 
-        x = self.final_conv(x)
-
-        x = einops.rearrange(x, "b d t -> b t d")
-        return x
+        features = einops.rearrange(x, "b d t -> b t d")
+        prediction = einops.rearrange(self.final_conv(x), "b d t -> b t d")
+        if return_features:
+            return prediction, features
+        return prediction
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):

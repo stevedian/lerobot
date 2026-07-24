@@ -25,10 +25,9 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 class DiffusionJEPAConfig(DiffusionConfig):
     """Diffusion Policy jointly trained with a LeWorldModel-style JEPA objective.
 
-    The policy and world model share one observation encoder. The JEPA predictor is
-    action-conditioned through zero-initialized adaptive LayerNorm and is trained
-    end-to-end with next-embedding prediction and SIGReg. It intentionally has no
-    target encoder, EMA update, or stop-gradient path.
+    The Diffusion policy and JEPA world model use separate observation encoders.
+    During training, a latent-action head on the Diffusion U-Net conditions the
+    world model. Inference evaluates only the policy vision encoder and U-Net.
     """
 
     # A deterministic crop is the safe default for temporal prediction. Sequence-
@@ -41,15 +40,18 @@ class DiffusionJEPAConfig(DiffusionConfig):
     jepa_predictor_mlp_ratio: float = 4.0
     jepa_predictor_dropout: float = 0.1
     jepa_prediction_horizon: int = 4
+    jepa_action_latent_dim: int = 192
 
     jepa_world_model_loss_weight: float = 0.02
     jepa_sigreg_weight: float = 0.1
     jepa_sigreg_num_projections: int = 512
     jepa_sigreg_num_frequencies: int = 17
     jepa_loss_ramp_steps: int = 20_000
+
+    # Legacy fields kept so checkpoints from the earlier JEPA-conditioned
+    # inference design can still be parsed. They are not used by this model.
     jepa_shared_encoder_gradient_scale: float = 0.1
     jepa_condition_residual_scale: float = 0.1
-
     use_jepa_candidate_selection: bool = False
     jepa_num_action_candidates: int = 8
     jepa_candidate_horizon: int = 4
@@ -79,6 +81,10 @@ class DiffusionJEPAConfig(DiffusionConfig):
             raise ValueError(
                 f"`jepa_predictor_dropout` must be in [0, 1). Got {self.jepa_predictor_dropout}."
             )
+        if self.jepa_action_latent_dim <= 0:
+            raise ValueError(
+                f"`jepa_action_latent_dim` must be positive. Got {self.jepa_action_latent_dim}."
+            )
 
         max_future_actions = self.horizon - self.n_obs_steps + 1
         if not 0 < self.jepa_prediction_horizon <= max_future_actions:
@@ -99,29 +105,11 @@ class DiffusionJEPAConfig(DiffusionConfig):
             raise ValueError("`jepa_sigreg_num_frequencies` must be at least 2.")
         if self.jepa_loss_ramp_steps < 0:
             raise ValueError("`jepa_loss_ramp_steps` must be non-negative.")
-        if not 0 <= self.jepa_shared_encoder_gradient_scale <= 1:
-            raise ValueError("`jepa_shared_encoder_gradient_scale` must be in [0, 1].")
-        if self.jepa_condition_residual_scale < 0:
-            raise ValueError("`jepa_condition_residual_scale` must be non-negative.")
-
-        if self.jepa_num_action_candidates < 1:
-            raise ValueError("`jepa_num_action_candidates` must be positive.")
-        if self.use_jepa_candidate_selection and self.jepa_num_action_candidates < 2:
-            raise ValueError("Candidate selection requires at least two action candidates.")
-        if not 0 < self.jepa_candidate_horizon <= self.n_action_steps:
+        if self.use_jepa_candidate_selection:
             raise ValueError(
-                "`jepa_candidate_horizon` must be in the executed action chunk. "
-                f"Got {self.jepa_candidate_horizon=} and {self.n_action_steps=}."
+                "`use_jepa_candidate_selection` is no longer supported: JEPA is training-only and "
+                "inference always uses Diffusion."
             )
-        if self.jepa_candidate_horizon > self.jepa_prediction_horizon:
-            raise ValueError(
-                "`jepa_candidate_horizon` cannot exceed the horizon used to train the world model. "
-                f"Got {self.jepa_candidate_horizon=} and {self.jepa_prediction_horizon=}."
-            )
-        for name in ("jepa_goal_weight", "jepa_smoothness_weight", "jepa_action_bound_weight"):
-            value = getattr(self, name)
-            if value < 0:
-                raise ValueError(f"`{name}` must be non-negative. Got {value}.")
 
     @property
     def observation_delta_indices(self) -> list[int]:

@@ -1,5 +1,9 @@
 # Diffusion + LeWorldModel JEPA 实现计划
 
+> **状态：已被新架构替代。** 本文记录的是早期的共享编码器、JEPA condition
+> fusion 和 candidate rerank 方案，不再对应当前代码。当前方案见
+> `docs/diffusion_jepa_training_only_design.md`。
+
 ## 1. 结论
 
 可以整合，推荐采用下面的组合，而不是直接把 ACT-JEPA 的 predictor 接到 Diffusion 后面：
