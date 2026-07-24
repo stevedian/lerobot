@@ -1,120 +1,115 @@
-# Diffusion-JEPA：独立双编码器、训练期监督
+# Diffusion-JEPA：VLA-JEPA 对齐结构
 
-## 结论
+## 模型边界
 
-当前架构按 VLA-JEPA 图中的职责边界设计，但用 Diffusion Policy 替换 LLM/action head：
+Diffusion-JEPA 使用两个完全独立的视觉编码器：
 
 ```text
-                    ┌──────────── 策略分支 ────────────┐
-observation history -> Vision Encoder -> Diffusion U-Net -> action chunk
-                                      └-> latent action tokens
-                                                    │
-                    ┌──── 仅训练时运行的 JEPA 分支 ────┐
-current/future obs -> JEPA Encoder -> state latents │
-current state latent + latent action tokens         │
-                    -> Latent World Model            │
-                    -> predicted future state latent │
-                    -> alignment + SIGReg loss       │
+策略历史观测
+  -> Diffusion Vision Encoder（可训练）
+  -> learnable latent-action queries
+       ├-> Diffusion U-Net condition -> action chunk
+       └-> token-level latent world model
+
+当前及未来视频
+  -> V-JEPA2 Encoder（预训练、冻结、仅训练时运行）
+  -> multi-view world-state patch tokens
+  -> token-level latent world model target
 ```
 
-两个 encoder 是两个独立的模块实例，没有 backbone、adapter 或 projector 参数共享。
-JEPA state 不融合进 Diffusion condition，也不用于 candidate rerank。
+V-JEPA2 与 Diffusion Vision Encoder 不共享 backbone、adapter 或 projector。
+V-JEPA2 只编码 RGB 视频，不编码机器人 state。
+预处理器会在 Diffusion 数据集归一化之前保留一份原始 RGB：策略编码器使用原有
+Diffusion-normalized 图像，V-JEPA2 使用原始 `[0, 1]` 图像后再应用其 ImageNet
+预处理。
 
 ## 训练数据流
 
-给定观测序列和专家动作：
+默认加载连续 8 帧，从当前时刻开始交给 tubelet size 为 2 的 V-JEPA2：
 
 ```text
-o_{t-n+1:t+H}, a_{t-n+1:t+H-1}
+8 video frames
+  -> 4 world-state time steps
+  -> 3 state transitions
 ```
 
-策略分支执行标准 Diffusion 训练：
+每个状态保留全部空间 patch token。多相机特征按照 VLA-JEPA Equation (1)
+沿 embedding dimension 拼接，不做全局池化。
+
+策略视觉特征与 learnable queries 通过 cross-attention 生成：
 
 ```text
-p = VisionEncoder(o_{t-n+1:t})
-x_tau = add_noise(a, epsilon, tau)
-epsilon_hat, h_diff = UNet(x_tau, tau, condition=p)
-L_diffusion = mse(epsilon_hat, epsilon)
-u = LatentActionHead(h_diff)
+z: [B, 3 transitions, K latent tokens, D]
 ```
 
-`h_diff` 取 U-Net decoder 在最终 action projection 之前的逐时刻隐藏特征，因此
-`u_i` 与 action horizon 一一对齐。latent-action head 只在训练 JEPA loss 时执行。
-
-JEPA 分支独立编码当前和未来观测：
+同一组 `z` 一方面汇聚后加入 Diffusion U-Net 的 global condition，另一方面与
+V-JEPA2 state patch tokens 在 world model 中按时间块交错：
 
 ```text
-z_i = JEPAEncoder(o_i)
-z_hat_{i+1} = WorldModel(z_<=i, u_<=i)
-L_align = mse(z_hat_{i+1}, z_{i+1})
-L_jepa = L_align + lambda_sigreg * SIGReg(z)
-L_total = L_diffusion + lambda_jepa * L_jepa
+[z_t^1 ... z_t^K, s_t^1 ... s_t^P]
 ```
 
-World model 通过两条路径接收 latent action：
-
-- 显式 latent-action token embedding，保证第一步训练就有梯度回到 Diffusion；
-- 每个 Transformer block 的 action-conditioned AdaLN。
-
-因此 alignment loss 的梯度路径为：
+同一时间块内为全注意力；不同时间块之间严格因果。预测器采用 teacher forcing：
 
 ```text
-L_align
-  -> Latent World Model
-  -> latent action tokens
-  -> LatentActionHead
-  -> Diffusion U-Net hidden features
-  -> Vision Encoder condition
+input  = states[:, :-1]
+target = stop_gradient(states[:, 1:])
 ```
 
-JEPA encoder 由 alignment loss 和 SIGReg 训练，但其参数不进入策略分支。
+总损失与论文 Equation (9) 对齐：
+
+```text
+L = L_diffusion + beta * L1(predicted_next_states, target_next_states)
+```
+
+默认 `beta=0.1`。由于 target 来自冻结的预训练 V-JEPA2，不使用 SIGReg、EMA
+target encoder 或防坍塌 projector。
 
 ## 推理数据流
 
 ```text
 observation history
-  -> Vision Encoder
+  -> Diffusion Vision Encoder
+  -> latent-action queries
   -> Diffusion iterative denoising
   -> action chunk
 ```
 
-推理不会调用：
-
-- JEPA Encoder；
-- latent-action head；
-- Latent World Model；
-- SIGReg；
-- goal latent 或 candidate scoring。
-
-所以部署延迟与普通 Diffusion Policy 保持同一条主路径。JEPA 相关权重可以在后续导出阶段
-裁剪，但在训练 checkpoint 中保留以支持继续训练。
-
-## 当前范围
-
-当前代码实现图中的 robot-data finetuning 数据流。human-video pretraining 还需要一个
-不依赖机器人 action/noisy action 输入的 latent-action query 路径，不能直接复用当前
-U-Net denoising输入；在定义 human-video dataset 接口之前不将其伪装成已经支持。
+推理不会调用 V-JEPA2 或 latent world model。latent-action query 模块属于
+Diffusion Policy 本身，并在训练与推理中保持相同的数据流。
+保存策略 checkpoint 时不会重复写入冻结的 V-JEPA2 权重；加载时按
+`jepa_encoder_name_or_path` 重新读取官方 checkpoint。
 
 ## 关键配置
 
 ```text
-jepa_latent_dim
-jepa_action_latent_dim
-jepa_prediction_horizon
-jepa_world_model_loss_weight
-jepa_sigreg_weight
-jepa_loss_ramp_steps
+jepa_encoder_name_or_path
+jepa_num_frames = 8
+jepa_prediction_horizon = 3
+jepa_action_tokens_per_transition = 8
+jepa_action_latent_dim = 1024
+jepa_latent_dim = 1024
+jepa_predictor_layers = 12
+jepa_predictor_heads = 8
+jepa_world_model_loss_weight = 0.1
 ```
 
-旧版 `jepa_condition_residual_scale`、shared-encoder gradient scale 和 candidate-selection
-字段仅为读取旧 config 保留，当前模型不会使用；`use_jepa_candidate_selection=true`
-会直接报错。
+`jepa_prediction_horizon` 必须等于
+`jepa_num_frames / vjepa2_tubelet_size - 1`。
+
+## 当前范围
+
+当前策略 forward 实现带机器人动作标签的联合训练。latent-action queries 已不依赖
+noisy action，因此模型结构具备 human-video world-model pretraining 的条件；但接入
+Something-Something-v2 等无动作视频，还需要独立的视频 dataset、无 state 的视觉输入
+接口及 co-training dataloader。
 
 ## 验证标准
 
-- Vision Encoder 与 JEPA Encoder 是不同模块、不同参数；
-- alignment loss 对 latent-action head 产生非零梯度；
-- 固定 U-Net 权重和 noise 时，推理动作与普通 Diffusion Policy 一致；
-- action generation 不触发任何 JEPA 模块；
-- JEPA predictor 保持因果性，未来 token 不影响较早预测；
-- 保存与加载后训练步数和模型参数一致。
+- V-JEPA2 始终为 eval 且所有参数 `requires_grad=False`；
+- 多相机 V-JEPA2 输出保持 patch token，并沿 embedding dimension 拼接；
+- optimizer 不包含 V-JEPA2 参数；
+- world-model L1 对 policy vision encoder 与 latent-action queries 产生梯度；
+- 修改未来视频不影响 policy latent actions；
+- 修改未来 world-model time block 不影响过去预测；
+- action generation 不触发 V-JEPA2 或 world-model predictor。
