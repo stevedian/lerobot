@@ -20,6 +20,7 @@ The majority of changes here involve removing unused code, unifying naming, and 
 """
 
 import math
+import logging
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
@@ -63,10 +64,36 @@ class ACTPolicy(PreTrainedPolicy):
 
         self.model = ACT(config)
 
+        if config.head_only_finetune:
+            self._enable_head_only_finetune()
+
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         self.reset()
+
+    def _enable_head_only_finetune(self) -> None:
+        """Freeze base layers and keep only decoder/action head trainable."""
+        trainable_prefixes = (
+            "model.decoder",
+            "model.decoder_pos_embed",
+            "model.action_head",
+        )
+
+        total_params = 0
+        trainable_params = 0
+        for name, param in self.named_parameters():
+            total_params += param.numel()
+            should_train = name.startswith(trainable_prefixes)
+            param.requires_grad = should_train
+            if should_train:
+                trainable_params += param.numel()
+
+        logging.info(
+            "ACT head-only finetune enabled: trainable params=%d / total params=%d",
+            trainable_params,
+            total_params,
+        )
 
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr

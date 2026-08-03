@@ -128,6 +128,11 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # Fine-tuning mode.
+    # When enabled, freezes ACT base layers and only trains the decoder + action head.
+    # This is useful for stage-2 per-mold specialization.
+    head_only_finetune: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
