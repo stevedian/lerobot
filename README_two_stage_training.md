@@ -5,6 +5,14 @@
 - 阶段 1：三模具融合训练（co-training）
 - 阶段 2：按模具独立头部微调（head-only finetune）
 
+当前配置还会将三种模具的任务 ID 以 one-hot 形式拼接到 `observation.state`：
+
+- 模具 A：`[1, 0, 0]`
+- 模具 B：`[0, 1, 0]`
+- 模具 C：`[0, 0, 1]`
+
+`task_id_num_classes: 0` 是默认值，表示完全关闭任务条件并保持原始 ACT 行为。
+
 适用范围：
 - 已在本仓库中新增 `head_only_finetune` 开关
 - 已提供 `examples/configs/two_stage_act` 下的配置模板
@@ -97,6 +105,10 @@ cd /home/jing/rebot_lerobot/lerobot
 
 - `dataset.episodes: null` 表示使用全部 episode（融合训练）
 - `policy.head_only_finetune: false`（阶段 1 必须是 false）
+- `policy.task_id_num_classes: 3`：启用三分类任务 one-hot
+- `policy.task_id_override: null`：阶段 1 使用数据集 batch 中的 `task_index`
+
+合并前请确保三份数据的 task 名称互不相同。合并工具按 task 名称生成 `task_index`；如果三份数据使用相同任务描述，它们会被当作同一个任务。
 
 ### 4.2 启动阶段 1
 
@@ -135,6 +147,10 @@ outputs/train/taskbook_stage1_multimold/checkpoints/last/pretrained_model
 - `policy.head_only_finetune: true`
   - 只训练 `decoder + decoder_pos_embed + action_head`
   - 底层编码部分冻结
+- `policy.task_id_num_classes: 3`
+- `policy.task_id_override`：模具 A/B/C 分别设置为 `0/1/2`
+
+阶段 2 使用 override 后，即使单模具数据集内部的 `task_index` 都是 0，也会输入正确的模具任务 ID。部署时加载对应专属 checkpoint，override 会随模型配置一起保存。
 
 ### 5.2 依次启动阶段 2
 

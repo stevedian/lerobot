@@ -133,6 +133,12 @@ class ACTConfig(PreTrainedConfig):
     # This is useful for stage-2 per-mold specialization.
     head_only_finetune: bool = False
 
+    # Optional categorical task conditioning. When enabled, ACT appends a one-hot
+    # task ID to observation.state before projecting the robot-state token.
+    # A value of 0 preserves the original ACT architecture and behavior.
+    task_id_num_classes: int = 0
+    task_id_override: int | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -155,6 +161,15 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.task_id_num_classes < 0:
+            raise ValueError("`task_id_num_classes` must be greater than or equal to 0.")
+        if self.task_id_override is not None:
+            if self.task_id_num_classes == 0:
+                raise ValueError("`task_id_override` requires `task_id_num_classes` to be enabled.")
+            if not 0 <= self.task_id_override < self.task_id_num_classes:
+                raise ValueError(
+                    f"`task_id_override` must be in [0, {self.task_id_num_classes - 1}]."
+                )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -168,6 +183,8 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.task_id_num_classes > 0 and not self.robot_state_feature:
+            raise ValueError("Task ID conditioning requires an `observation.state` input feature.")
 
     @property
     def observation_delta_indices(self) -> None:

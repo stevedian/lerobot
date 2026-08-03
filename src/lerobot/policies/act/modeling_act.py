@@ -19,8 +19,8 @@ As per Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (https
 The majority of changes here involve removing unused code, unifying naming, and adding helpful comments.
 """
 
-import math
 import logging
+import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
@@ -37,6 +37,8 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+TASK_INDEX = "task_index"
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -327,7 +329,8 @@ class ACT(nn.Module):
             # Projection layer for joint-space configuration to hidden dimension.
             if self.config.robot_state_feature:
                 self.vae_encoder_robot_state_input_proj = nn.Linear(
-                    self.config.robot_state_feature.shape[0], config.dim_model
+                    self.config.robot_state_feature.shape[0] + self.config.task_id_num_classes,
+                    config.dim_model,
                 )
             # Projection layer for action (joint-space target) to hidden dimension.
             self.vae_encoder_action_input_proj = nn.Linear(
@@ -366,7 +369,8 @@ class ACT(nn.Module):
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
             self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
+                self.config.robot_state_feature.shape[0] + self.config.task_id_num_classes,
+                config.dim_model,
             )
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
@@ -402,6 +406,40 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def _task_conditioned_robot_state(self, batch: dict[str, Tensor]) -> Tensor:
+        """Append a one-hot task ID to the robot state when task conditioning is enabled."""
+        robot_state = batch[OBS_STATE]
+        num_classes = self.config.task_id_num_classes
+        if num_classes == 0:
+            return robot_state
+
+        batch_size = robot_state.shape[0]
+        if self.config.task_id_override is not None:
+            task_ids = torch.full(
+                (batch_size,),
+                self.config.task_id_override,
+                device=robot_state.device,
+                dtype=torch.long,
+            )
+        else:
+            if TASK_INDEX not in batch:
+                raise KeyError(
+                    f"ACT task conditioning is enabled, but `{TASK_INDEX}` is missing from the batch. "
+                    "Provide task_index or configure task_id_override."
+                )
+            task_ids = torch.as_tensor(batch[TASK_INDEX], device=robot_state.device, dtype=torch.long)
+            if task_ids.numel() != batch_size:
+                raise ValueError(
+                    f"Expected one task ID per batch item ({batch_size}), got shape {tuple(task_ids.shape)}."
+                )
+            task_ids = task_ids.reshape(batch_size)
+
+        if torch.any(task_ids < 0) or torch.any(task_ids >= num_classes):
+            raise ValueError(f"Task IDs must be in [0, {num_classes - 1}], got {task_ids.tolist()}.")
+
+        task_one_hot = F.one_hot(task_ids, num_classes=num_classes).to(dtype=robot_state.dtype)
+        return torch.cat((robot_state, task_one_hot), dim=-1)
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -427,6 +465,7 @@ class ACT(nn.Module):
             )
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        robot_state = self._task_conditioned_robot_state(batch) if self.config.robot_state_feature else None
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -435,7 +474,7 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(robot_state)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -487,7 +526,7 @@ class ACT(nn.Module):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(robot_state))
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))

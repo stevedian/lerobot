@@ -14,6 +14,8 @@
     "push_to_hub": false,
     "repo_id": null,
     "head_only_finetune": false,
+    "task_id_num_classes": 3,
+    "task_id_override": null,
     "optimizer_lr": 1e-5,
     "optimizer_lr_backbone": 1e-5,
     "optimizer_weight_decay": 1e-4,
