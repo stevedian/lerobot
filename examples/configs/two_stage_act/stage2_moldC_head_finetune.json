@@ -1,0 +1,42 @@
+{
+  "dataset": {
+    "repo_id": "replace_with_your_dataset_repo_id",
+    "root": null,
+    "episodes": [200, 201, 202],
+    "revision": null,
+    "use_imagenet_stats": true,
+    "streaming": false
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "use_amp": true,
+    "push_to_hub": false,
+    "repo_id": null,
+    "pretrained_path": "outputs/train/taskbook_stage1_multimold/checkpoints/last/pretrained_model",
+    "head_only_finetune": true,
+    "optimizer_lr": 5e-6,
+    "optimizer_lr_backbone": 5e-6,
+    "optimizer_weight_decay": 1e-4,
+    "chunk_size": 100,
+    "n_action_steps": 100,
+    "use_vae": true,
+    "kl_weight": 10.0
+  },
+  "output_dir": "outputs/train/taskbook_stage2_moldC",
+  "job_name": "taskbook_stage2_moldC",
+  "resume": false,
+  "seed": 1000,
+  "num_workers": 4,
+  "batch_size": 8,
+  "steps": 30000,
+  "eval_freq": 0,
+  "log_freq": 200,
+  "save_checkpoint": true,
+  "save_freq": 5000,
+  "use_policy_training_preset": true,
+  "wandb": {
+    "enable": false,
+    "project": "lerobot"
+  }
+}

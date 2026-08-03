@@ -1,0 +1,14 @@
+{
+  "repo_id": "replace_with_output_merged_repo_id",
+  "root": null,
+  "new_repo_id": null,
+  "push_to_hub": false,
+  "operation": {
+    "type": "merge",
+    "repo_ids": [
+      "replace_with_mold_a_repo_id",
+      "replace_with_mold_b_repo_id",
+      "replace_with_mold_c_repo_id"
+    ]
+  }
+}
